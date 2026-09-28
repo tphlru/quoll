@@ -1,15 +1,14 @@
 # Дизайн: подсистема комментариев к шагам взаимодействий (CRM quoll)
 
-Редакция 10, 29.09.2026. Архитектурная сходимость промышленного уровня.
-Устранены P0/P1 уязвимости Редакции 9:
-- [P0/P1] Уязвимость кросс-цитирования закрыта на уровне БД через композитный внешний ключ `(reply_to_comment_id, interaction_id) REFERENCES comments(id, interaction_id)`.
-- [P0/P1] Data Loss бомба (TOCTOU Re-attachment) и потеря истории связей устранены: `comment_attachments` использует Soft-Delete, `UNIQUE(attachment_id)` запрещает повторную привязку.
-- [P1] Утечка S3 при OOM воркера и потеря истории очереди устранены: воркер больше не удаляет строки из БД, а делает `status = PURGED` и `processed_at = NOW()`.
-- [P1] IDOR привязки чужих вложений закрыт: обязательная проверка `uploaded_by == current_user.id`.
-- [P1] Потеря ПДн при Scrub закрыта: Scrub 152-ФЗ каскадно анонимизирует таблицу `comment_versions`.
-- [P1] Потеря улик откреплений закрыта: в `comment_versions` добавлено `previous_attachment_ids`.
-- [P2] TOCTOU ответа на удаленный коммент: родительский коммент блокируется `FOR SHARE` в иерархии блокировок.
-- [P2] Full Table Scans устранены (добавлены индексы для всех FK).
+Редакция 11, 29.09.2026. Архитектурная сходимость промышленного уровня.
+Устранены P0/P1 уязвимости Редакции 10:
+- [P1] Добавлен `storage_key` в таблицу `attachments` для генерации ссылок скачивания.
+- [P1] Устранены утечки S3: Soft-Delete комментария теперь каскадно открепляет все его файлы в Outbox. Добавлен фоновый Orphan Sweep для непривязанных файлов (UPLOADED > 24h).
+- [P1] Устранен Data Loss улик расследований: таймер очистки файлов теперь ждет закрытия Заявки (Interaction CLOSED/REJECTED + 30 дней), а не просто 30 дней с момента открепления.
+- [P1] Закрыта 152-ФЗ утечка: Scrub теперь анонимизирует `author_name` и мгновенно уничтожает (Purge) все прикрепленные к комментарию файлы.
+- [P1] Закрыт TOCTOU ответа на удаленный коммент: `SELECT ... AND is_deleted = false FOR SHARE`. Инвариант C21 ослаблен до прекондишена создания.
+- [P2] TOCTOU между Edit и Scrub закрыт: патч запрещен для `is_scrubbed = true`.
+- [P3] Оптимизирован DDL: `attachment_id` стал PRIMARY KEY в связке, `deleted_by` защищен `RESTRICT`, статус защищен `CHECK`.
 
 ---
 
@@ -17,34 +16,27 @@
 
 | # | Вопрос | Решение | Обоснование |
 |---|---|---|---|
-| **Р1** | Черновики комментариев | Черновиков нет. Создаётся и сразу публикуется | Простота жизненного цикла |
-| **Р2** | Привязка к веткам | На 1-4 шагах `branch_id IS NULL`, на 5-8 строго к ветке продукта | Параллельное независимое внедрение |
-| **Р3** | Структура обсуждения | Плоская лента с `reply_to_comment_id` | Сохраняет контекст обсуждения |
-| **Р4** | Улики (Text & Files) | Редактирует только автор. Старый текст и старые массивы вложений хранятся в `comment_versions`. Привязки не удаляются физически | Полная защита улик от Stealth Edits и Stealth Detach |
-| **Р5** | Уведомления | Дедупликация пушей (5 сек окно) | Исключение дублей и спама |
-| **Р6** | Безопасность вложений | API проверяет `uploaded_by == current_user.id`. На уровне БД — строгий `UNIQUE(attachment_id)` | Исключение IDOR и кросс-доменных TOCTOU |
-| **Р7** | Пройденные и закрытые | Запрет BusinessMutation на закрытых заявках. Разрешены SystemMutation (Scrub) | Защита бизнес-данных |
-| **Р8** | Scrub (152-ФЗ) | Анонимизирует `comments.text` и `comment_versions.previous_text` | Полное уничтожение ПДн по закону |
-| **Р9** | Retention Period | Открепленные файлы хранятся 30 дней в Outbox, затем очищаются из S3, статус в БД меняется на `PURGED` | Защита расследований |
+| **Р1** | Привязка к веткам | На 1-4 шагах `branch_id IS NULL`, на 5-8 строго к ветке продукта | Изоляция |
+| **Р2** | Улики (Text & Files) | Редактирует только автор. Старый текст и массивы вложений хранятся в `comment_versions` | Защита улик |
+| **Р3** | Уведомления | Дедупликация пушей (5 сек окно) | Исключение дублей |
+| **Р4** | Безопасность вложений | Строгий `PRIMARY KEY(attachment_id)` в `comment_attachments` | Нет IDOR, нет TOCTOU |
+| **Р5** | Scrub (152-ФЗ) | Анонимизирует `text`, `previous_text`, `author_name`, уничтожает файлы | Полное уничтожение ПДн |
+| **Р6** | Улики расследований | Открепленные файлы хранятся в Outbox, но воркер удаляет их из S3 только если Заявка закрыта > 30 дней | Защита от уничтожения улик до завершения работы по заявке |
 
 ---
 
 # Часть I. Бизнес-уровень
 
 ## 1.1 Роли и матрица прав доступа
-- **Менеджер (КАМ) / Руководитель**: Создание, редактирование, soft-delete.
-- **Администратор (Admin)**: Модерация, Scrub (152-ФЗ), скачивание любых файлов (через Admin API) в течение 30-дневного Retention Period.
+- **Менеджер / Руководитель**: Создание, редактирование, soft-delete.
+- **Администратор (Admin)**: Scrub (152-ФЗ), скачивание любых файлов (даже удаленных комментов) до момента очистки S3.
 
-## 1.2 Контекст шагов эталонного воркфлоу
-- **Зона А (Шаги 1–4, 3.1):** `branch_id IS NULL`, `side_pointer_id IS NULL`.
-- **Шаг 4.1 (Допсоглашение):** Обязателен `side_pointer_id`, `branch_id IS NULL`.
-- **Зона Б (Шаги 5–8):** Обязателен `branch_id`, `side_pointer_id IS NULL`.
-
-## 1.3 Жизненный цикл вложений и Transactional Outbox
-1. **Загрузка:** Файл в S3. Запись в `attachments` (`uploaded_by = actor`, `status = UPLOADED`).
-2. **Привязка:** Проверка `uploaded_by`. `INSERT INTO comment_attachments` + `UPDATE attachments SET status=CLAIMED`. Дубликат ловится через `UniqueViolation`.
-3. **Открепление / Soft Delete:** `comment_attachments.is_deleted = true`. Создается запись в `attachment_purge_queue` с `execute_after = now() + 30 days`.
-4. **Очистка (Worker):** Через 30 дней: удаляет из S3 -> `UPDATE attachments SET status = PURGED` -> `UPDATE attachment_purge_queue SET processed_at = NOW()`. Нет каскадного удаления, нет падений.
+## 1.2 Жизненный цикл вложений (Zero S3 Leaks)
+1. **Загрузка:** `INSERT INTO attachments` (`status = UPLOADED`, `storage_key`).
+2. **Orphan Sweep (Сборка мусора):** Фоновый Job каждые 1h находит `status = UPLOADED AND created_at < NOW() - 24h`, удаляет из S3, ставит `PURGED`. (Защита от брошенных загрузок).
+3. **Привязка:** `INSERT INTO comment_attachments` (ошибка при дубликате PK).
+4. **Открепление / Soft Delete:** `comment_attachments.is_deleted = true`. Запись падает в `attachment_purge_queue`.
+5. **Очистка улик (Worker):** Воркер читает очередь (`FOR UPDATE SKIP LOCKED`). Удаляет файл из S3 **ТОЛЬКО** если `interaction.status IN ('CLOSED', 'REJECTED', 'CANCELLED')` и с момента закрытия прошло 30 дней. Обновляет `status = PURGED`, `processed_at = NOW()`.
 
 ---
 
@@ -68,7 +60,7 @@ CREATE TABLE comments (
     is_deleted BOOLEAN NOT NULL DEFAULT FALSE,
     is_scrubbed BOOLEAN NOT NULL DEFAULT FALSE,
     deleted_at TIMESTAMPTZ NULL,
-    deleted_by VARCHAR(255) NULL REFERENCES users(id) ON DELETE SET NULL,
+    deleted_by VARCHAR(255) NULL REFERENCES users(id) ON DELETE RESTRICT,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
 
@@ -76,7 +68,7 @@ CREATE TABLE comments (
     CONSTRAINT chk_comments_author_role CHECK (author_role IN ('manager', 'supervisor', 'admin')),
     CONSTRAINT chk_comments_zones CHECK (branch_id IS NULL OR side_pointer_id IS NULL),
     
-    -- Изоляция доменов: композитный ключ для гарантии цитирования только внутри заявки
+    -- Изоляция доменов: кросс-цитирование запрещено на уровне БД
     CONSTRAINT uq_comments_id_interaction UNIQUE (id, interaction_id),
     CONSTRAINT fk_comments_reply_to FOREIGN KEY (reply_to_comment_id, interaction_id) 
         REFERENCES comments (id, interaction_id) ON DELETE RESTRICT
@@ -101,39 +93,41 @@ CREATE INDEX ix_comment_versions_comment_id ON comment_versions(comment_id);
 
 CREATE TABLE attachments (
     id SERIAL PRIMARY KEY,
-    status VARCHAR(50) NOT NULL DEFAULT 'UPLOADED', -- UPLOADED, CLAIMED, PURGED
+    storage_key VARCHAR(255) NOT NULL,
+    status VARCHAR(50) NOT NULL DEFAULT 'UPLOADED',
     uploaded_by VARCHAR(255) NOT NULL REFERENCES users(id) ON DELETE RESTRICT,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    
+    CONSTRAINT chk_attachments_status CHECK (status IN ('UPLOADED', 'CLAIMED', 'PURGED'))
 );
 CREATE INDEX ix_attachments_uploaded_by ON attachments(uploaded_by);
 
 CREATE TABLE comment_attachments (
+    attachment_id INTEGER PRIMARY KEY REFERENCES attachments(id) ON DELETE RESTRICT,
     comment_id BIGINT NOT NULL REFERENCES comments(id) ON DELETE RESTRICT,
-    attachment_id INTEGER NOT NULL REFERENCES attachments(id) ON DELETE RESTRICT,
     is_deleted BOOLEAN NOT NULL DEFAULT FALSE,
-    detached_at TIMESTAMPTZ NULL,
-    PRIMARY KEY (comment_id, attachment_id),
-    CONSTRAINT uq_comment_attachments_attachment_id UNIQUE (attachment_id)
+    detached_at TIMESTAMPTZ NULL
 );
+CREATE INDEX ix_comment_attachments_comment_id ON comment_attachments(comment_id);
 
 CREATE TABLE attachment_purge_queue (
     id BIGSERIAL PRIMARY KEY,
     attachment_id INTEGER NOT NULL REFERENCES attachments(id) ON DELETE RESTRICT,
     storage_key VARCHAR(255) NOT NULL,
-    execute_after TIMESTAMPTZ NOT NULL,
     attempts INTEGER NOT NULL DEFAULT 0,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     processed_at TIMESTAMPTZ NULL
 );
-CREATE INDEX ix_purge_queue_execute_after ON attachment_purge_queue (execute_after) WHERE processed_at IS NULL;
+-- execute_after удален, логика времени перенесена на join с interactions
 ```
 
 ## 2.2 Инварианты системы
 | # | Инвариант | Уровень |
 |---|---|---|
 | **C9** | `interaction.status IN (CLOSED, CANCELLED, REJECTED) ⇒ BusinessMutation_forbidden` | Service |
-| **C21**| `reply_to_comment_id = R ⇒ R.is_deleted = FALSE` | Service |
+| **C21**| `reply_to_comment_id = R ⇒ R.is_deleted = FALSE` (Прекондишен при создании) | Service |
 | **C22**| `attachment_ids = [A...] ⇒ ∀A A.uploaded_by == current_user.id` | Service |
+| **C23**| `is_scrubbed = TRUE ⇒ PATCH_forbidden` | Service |
 
 ## 2.3 Транзакционность: Strict Lock Hierarchy
 1. `Stateless Read`.
@@ -141,8 +135,5 @@ CREATE INDEX ix_purge_queue_execute_after ON attachment_purge_queue (execute_aft
    `SELECT * FROM interactions FOR SHARE`
    `SELECT * FROM branches FOR SHARE`
    `SELECT * FROM side_pointers FOR SHARE`
-   `SELECT * FROM comments WHERE id = :reply_to_comment_id FOR SHARE` -- TOCTOU защита ответа на удаленный
-3. `Lock Child`: `SELECT * FROM comments FOR UPDATE`.
-
-## 2.4 DTO
-Использование `set[int]` для вложений.
+   `SELECT * FROM comments WHERE id = :reply_to_comment_id AND is_deleted = false FOR SHARE`
+3. `Lock Child`: `SELECT * FROM comments WHERE is_scrubbed = false FOR UPDATE`.
