@@ -1,13 +1,7 @@
 # Дизайн: подсистема комментариев к шагам взаимодействий (CRM quoll)
 
-Редакция 16 (Absolute Monolith), 29.09.2026.
-Устранены сложнейшие краевые сценарии отказа распределенных систем:
-- [P0] Deadlock удаления пользователей (152-ФЗ): Scrub теперь явным образом обнуляет `author_id`, `deleted_by` и `uploaded_by`.
-- [P1] Восстановление из состояния `PROCESSING` (Crash Recovery): если под с воркером падает (OOM), зависшие в очереди задачи подхватываются через 1 час благодаря новому полю `updated_at`.
-- [P1] Тупик стейт-машины при гонке Reopen и ошибки S3 устранен безопасным Fallback-апдейтом.
-- [P1] Изоляция ответов: введен жесткий API-запрет на удаление комментария, если у него есть активные дочерние ответы (защита от Orphan Replies).
-- [P2] Изоляция Зон (C22) теперь гарантируется на уровне БД триггером `trg_check_zones`.
-- [P3] Очередь очистки получила Retention-джоб для защиты от бесконечного разрастания.
+Редакция 17 (Gold Standard), 29.09.2026.
+Устранены финальные краевые дефекты 152-ФЗ и стейт-машины очередей.
 
 ---
 
@@ -15,16 +9,16 @@
 | # | Вопрос | Решение |
 |---|---|---|
 | **Р1** | Изоляция Зон | Гарантируется триггером в СУБД: `branch_id` И `side_pointer_id` родителя и ответа обязаны совпадать |
-| **Р2** | Scrub (152-ФЗ) | Анонимизирует `text`, `previous_text`, `author_name` и обнуляет все FK. **Синхронно блокирует** удаление пользователя до выжигания ПДн оркестратором (`ON DELETE RESTRICT`) |
-| **Р3** | Lock-Free S3 | Воркеры очереди не держат транзакции БД во время I/O (S3). Зависшие задачи восстанавливаются |
+| **Р2** | Scrub (152-ФЗ) | Анонимизирует `text`, `previous_text`, `author_name` и глобально обнуляет все FK (`uploaded_by`, `deleted_by`). Разделяет логику авторов и модераторов. |
+| **Р3** | Lock-Free S3 | Воркеры очереди не держат транзакции БД во время I/O (S3). Зависшие задачи восстанавливаются. |
 
 ---
 
 # Часть I. Бизнес-уровень
 
 ## 1.1 Роли и инварианты
-- **C21**: `reply_to_comment_id = R ⇒ R.is_deleted = FALSE`. **Запрет каскадов**: API отклоняет Soft-Delete комментария, если у него есть активные ответы (защита графа тредов).
-- **C22**: Изоляция Зон. `parent.branch_id IS NOT DISTINCT FROM child.branch_id AND parent.side_pointer_id IS NOT DISTINCT FROM child.side_pointer_id`. (Обеспечивается триггером БД).
+- **C21**: `reply_to_comment_id = R ⇒ R.is_deleted = FALSE`. **Запрет каскадов**: API отклоняет Soft-Delete комментария, если у него есть активные ответы.
+- **C22**: Изоляция Зон. (Обеспечивается триггером БД).
 - **C23**: `is_scrubbed = TRUE ∨ is_deleted = TRUE ⇒ PATCH_forbidden`.
 - **C24**: Авторизация. `Edit / Delete ⇒ author_id == current_user.id ∨ role ∈ (supervisor, admin)`.
 
@@ -34,11 +28,12 @@
 3. **Orphan Sweep:** Фоновый Job 1h: `UPDATE attachments SET status='PURGING', updated_at=NOW() WHERE id IN (SELECT id FROM attachments WHERE (status='UPLOADED' AND created_at < NOW() - 24h) OR (status='PURGING' AND updated_at < NOW() - 1h) FOR UPDATE SKIP LOCKED)`. Удаляет из S3 -> `UPDATE status='PURGED'`.
 4. **Soft-Delete Коммента / Detach через Edit:** `is_deleted = true`, `detached_at = NOW()`. `UPSERT` файла в `attachment_purge_queue` (`reason='SOFT_DELETE'`, `status='PENDING'`). Если Заявка `CLOSED` -> `execute_after = NOW() + 30 days`, иначе `NULL`.
 5. **Scrub (152-ФЗ):** Разрешает удаление пользователя из БД.
-   - Выжигает ПДн: `text='[УДАЛЕНО]', author_name='[УДАЛЕНО]', author_id=NULL, deleted_by=NULL, is_scrubbed=true`.
-   - Выжигает историю: `UPDATE comment_versions SET previous_text='[УДАЛЕНО]' WHERE comment_id = :id`.
-   - Выжигает файлы: `UPSERT` всех файлов коммента (вкл. исторически удаленные) в очередь очистки с `reason='SCRUB', execute_after=NOW(), status='PENDING'`. Обнуляет `uploaded_by=NULL` для этих вложений. (При конфликте в очереди статус `SCRUB` не понижается).
+   - Глобальное обнуление метаданных: `UPDATE attachments SET uploaded_by = NULL WHERE uploaded_by = :id` и `UPDATE comments SET deleted_by = NULL WHERE deleted_by = :id`.
+   - Выжигает ПДн: `UPDATE comments SET text='[УДАЛЕНО]', author_name='[УДАЛЕНО]', author_id=NULL, is_scrubbed=true WHERE author_id = :id`.
+   - Выжигает историю: `UPDATE comment_versions SET previous_text='[УДАЛЕНО]' WHERE comment_id IN (SELECT id FROM comments WHERE author_id = :id)`.
+   - Выжигает файлы: `UPSERT` всех файлов коммента в очередь с `reason='SCRUB', execute_after=NOW(), status='PENDING'`. 
 6. **Закрытие Заявки:** `UPDATE attachment_purge_queue SET execute_after = NOW() + 30 days, updated_at=NOW() WHERE interaction_id = :id AND execute_after IS NULL AND status != 'DONE'`.
-7. **Reopen Заявки:** `UPDATE attachment_purge_queue SET execute_after = NULL, updated_at=NOW() WHERE interaction_id = :id AND reason='SOFT_DELETE' AND status != 'DONE'`.
+7. **Reopen Заявки:** `UPDATE attachment_purge_queue SET execute_after = NULL, status = 'PENDING', updated_at=NOW() WHERE interaction_id = :id AND reason='SOFT_DELETE' AND status != 'DONE'`.
 8. **Очистка улик (Lock-Free Worker & Crash Recovery):** 
    - *Фаза 1 (DB)*: `UPDATE attachment_purge_queue SET status='PROCESSING', updated_at=NOW() WHERE attachment_id IN (SELECT attachment_id FROM attachment_purge_queue WHERE (status='PENDING' AND execute_after <= NOW()) OR (status='PROCESSING' AND updated_at < NOW() - 1h) FOR UPDATE SKIP LOCKED) RETURNING storage_key`.
    - *Фаза 2 (Network)*: Вызов S3 DELETE (Транзакция БД отпущена).
@@ -132,6 +127,7 @@ CREATE TABLE attachment_purge_queue (
 );
 CREATE INDEX ix_purge_queue_execute_after ON attachment_purge_queue (execute_after) WHERE status = 'PENDING';
 CREATE INDEX ix_purge_queue_interaction ON attachment_purge_queue (interaction_id);
+CREATE INDEX ix_purge_queue_processing ON attachment_purge_queue (updated_at) WHERE status = 'PROCESSING';
 
 -- Триггер для аппаратной гарантии изоляции зон (C22)
 CREATE OR REPLACE FUNCTION check_zones() RETURNS TRIGGER AS $$
