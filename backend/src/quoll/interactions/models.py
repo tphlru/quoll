@@ -272,6 +272,9 @@ class StageChangeKind(StrEnum):
     RESTART = "RESTART"  # завершённая ветка вернулась на начало веток (Д21)
     SLOT_PASSIVE = "SLOT_PASSIVE"  # увели в пассивные слоты (Д19)
     SLOT_ACTIVE = "SLOT_ACTIVE"
+    SIDE_STARTED = "SIDE_STARTED"
+    SIDE_FINISHED = "SIDE_FINISHED"
+    SIDE_CANCELLED = "SIDE_CANCELLED"
 
 
 class InteractionStageHistory(Base):
@@ -317,6 +320,10 @@ class InteractionStageHistory(Base):
         nullable=True,
         index=True,
     )
+    # прохождение: NULL - основной указатель, иначе конкретный доп. указатель
+    side_pointer_id: Mapped[int | None] = mapped_column(
+        ForeignKey("side_pointers.id", ondelete="CASCADE"), nullable=True, index=True
+    )
     # структура события для отчётов: {sa_id, old, new, ...}
     payload: Mapped[dict[str, Any]] = mapped_column(
         JSONB, default=dict, server_default=text("'{}'::jsonb")
@@ -352,12 +359,75 @@ class InteractionAssignment(Base):
     reason: Mapped[str | None] = mapped_column(Text, nullable=True)
 
 
+class SidePointerStatus(StrEnum):
+    ACTIVE = "ACTIVE"
+    FINISHED = "FINISHED"
+    CANCELLED = "CANCELLED"
+
+
+class SidePointer(Base):
+    """доп. указатель: проходит доп. шаги, пока основной уже ушёл дальше.
+
+    своих блокировок нет - прикрывает Interaction, как ветки и ДС
+    """
+
+    __tablename__ = "side_pointers"
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('ACTIVE', 'FINISHED', 'CANCELLED')",
+            name="chk_side_pointer_status",
+        ),
+        CheckConstraint(
+            "(status = 'ACTIVE') = (finished_at IS NULL)",
+            name="chk_side_pointer_finished",
+        ),
+        # одновременно активен один доп. указатель заявки (I1)
+        Index(
+            "uq_side_pointers_active",
+            "interaction_id",
+            unique=True,
+            postgresql_where=text("status = 'ACTIVE'"),
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    interaction_id: Mapped[int] = mapped_column(
+        ForeignKey("interactions.id", ondelete="CASCADE"), index=True
+    )
+    # каркас Д40: доп. указатель ветки, сейчас всегда NULL
+    branch_id: Mapped[int | None] = mapped_column(
+        ForeignKey("branches.id", ondelete="CASCADE"), nullable=True
+    )
+    entry_stage_id: Mapped[int] = mapped_column(
+        ForeignKey("stages.id", ondelete="RESTRICT")
+    )
+    # где стоит; у завершённого - последний доп. шаг
+    stage_id: Mapped[int] = mapped_column(ForeignKey("stages.id", ondelete="RESTRICT"))
+    status: Mapped[str] = mapped_column(
+        String(20),
+        default=SidePointerStatus.ACTIVE,
+        server_default=SidePointerStatus.ACTIVE,
+    )
+    started_by: Mapped[str | None] = mapped_column(
+        ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
+    started_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=text("now()")
+    )
+    finished_by: Mapped[str | None] = mapped_column(
+        ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
+    finished_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    finish_comment: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+
 class RequestKind(StrEnum):
     TRANSFER = "TRANSFER"
     CLOSE = "CLOSE"
     # аппрув перехода по ребру с requires_approval
     TRANSITION = "TRANSITION"
-    SA_APPROVAL = "SA_APPROVAL"  # одобрение допсоглашения
 
 
 class RequestStatus(StrEnum):
@@ -373,17 +443,8 @@ class InteractionRequest(Base):
 
     __table_args__ = (
         CheckConstraint(
-            "kind IN ('TRANSFER', 'CLOSE', 'TRANSITION', 'SA_APPROVAL')",
+            "kind IN ('TRANSFER', 'CLOSE', 'TRANSITION')",
             name="chk_request_kind",
-        ),
-        # у одобрения допсоглашения - только ссылка на него
-        CheckConstraint(
-            "(kind = 'SA_APPROVAL') = (supplementary_agreement_id IS NOT NULL) "
-            "AND (kind <> 'SA_APPROVAL' OR (target_stage_id IS NULL "
-            "AND target_manager_id IS NULL AND transition_id IS NULL "
-            "AND branch_id IS NULL AND close_reason_id IS NULL "
-            "AND branch_close_reason_id IS NULL))",
-            name="chk_request_sa",
         ),
         # у перехода - ребро и его цель; у остальных ребра нет
         CheckConstraint(
@@ -418,12 +479,13 @@ class InteractionRequest(Base):
             "(status = 'PENDING') = (decided_at IS NULL)",
             name="chk_request_decided",
         ),
-        # аппрувы разных веток ждут параллельно
+        # аппрувы разных веток и разных прохождений ждут параллельно
         Index(
             "uq_interaction_requests_pending",
             "interaction_id",
             "kind",
             "branch_id",
+            "side_pointer_id",
             unique=True,
             postgresql_where=text("status = 'PENDING'"),
             postgresql_nulls_not_distinct=True,
@@ -431,6 +493,10 @@ class InteractionRequest(Base):
         CheckConstraint(
             "branch_id IS NULL OR kind IN ('TRANSITION', 'CLOSE')",
             name="chk_request_branch_only_transition",
+        ),
+        CheckConstraint(
+            "side_pointer_id IS NULL OR (kind = 'TRANSITION' AND branch_id IS NULL)",
+            name="chk_request_side_only_transition",
         ),
     )
 
@@ -477,8 +543,9 @@ class InteractionRequest(Base):
         DateTime(timezone=True), nullable=True
     )
     decision_comment: Mapped[str | None] = mapped_column(Text, nullable=True)
-    supplementary_agreement_id: Mapped[int | None] = mapped_column(
-        ForeignKey("supplementary_agreements.id"), nullable=True
+    # прохождение: NULL - основной указатель, иначе конкретный доп. указатель
+    side_pointer_id: Mapped[int | None] = mapped_column(
+        ForeignKey("side_pointers.id", ondelete="CASCADE"), nullable=True, index=True
     )
     created_at: Mapped[created_at_dt]
 
@@ -565,6 +632,10 @@ class InteractionDocument(Base):
     supplementary_agreement_id: Mapped[int | None] = mapped_column(
         ForeignKey("supplementary_agreements.id"), nullable=True, index=True
     )
+    # прохождение: NULL - основной указатель, иначе конкретный доп. указатель
+    side_pointer_id: Mapped[int | None] = mapped_column(
+        ForeignKey("side_pointers.id", ondelete="CASCADE"), nullable=True, index=True
+    )
     created_at: Mapped[created_at_dt]
 
 
@@ -581,10 +652,11 @@ class InteractionStageValues(Base):
     __tablename__ = "interaction_stage_values"
     __table_args__ = (
         Index(
-            "uq_stage_values_interaction_stage_branch",
+            "uq_stage_values_pass",
             "interaction_id",
             "stage_id",
             "branch_id",
+            "side_pointer_id",
             unique=True,
             postgresql_nulls_not_distinct=True,
         ),
@@ -597,6 +669,10 @@ class InteractionStageValues(Base):
     stage_id: Mapped[int] = mapped_column(ForeignKey("stages.id", ondelete="RESTRICT"))
     branch_id: Mapped[int | None] = mapped_column(
         ForeignKey("branches.id", ondelete="CASCADE"), nullable=True
+    )
+    # прохождение: NULL - основной указатель, иначе конкретный доп. указатель
+    side_pointer_id: Mapped[int | None] = mapped_column(
+        ForeignKey("side_pointers.id", ondelete="CASCADE"), nullable=True, index=True
     )
     values: Mapped[dict[str, Any]] = mapped_column(
         JSONB, default=dict, server_default=text("'{}'::jsonb")
@@ -762,7 +838,6 @@ class AgreementStatus(StrEnum):
     DRAFT = "DRAFT"
     PENDING = "PENDING"
     APPROVED = "APPROVED"
-    REJECTED = "REJECTED"
     CANCELLED = "CANCELLED"
 
 
@@ -773,12 +848,11 @@ class SupplementaryAgreement(Base):
     __tablename__ = "supplementary_agreements"
     __table_args__ = (
         CheckConstraint(
-            "status IN ('DRAFT', 'PENDING', 'APPROVED', 'REJECTED', 'CANCELLED')",
+            "status IN ('DRAFT', 'PENDING', 'APPROVED', 'CANCELLED')",
             name="chk_sa_status",
         ),
         CheckConstraint(
-            "(status IN ('APPROVED', 'REJECTED', 'CANCELLED')) = "
-            "(decided_at IS NOT NULL)",
+            "(status IN ('APPROVED', 'CANCELLED')) = (decided_at IS NOT NULL)",
             name="chk_sa_decided",
         ),
         # незавершённое у заявки одно - «второй указатель» (М 3.11)
@@ -793,6 +867,10 @@ class SupplementaryAgreement(Base):
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
     interaction_id: Mapped[int] = mapped_column(
         ForeignKey("interactions.id", ondelete="CASCADE"), index=True
+    )
+    # прохождение, чей шаг 4.1 держит это ДС: NULL - основной указатель
+    side_pointer_id: Mapped[int | None] = mapped_column(
+        ForeignKey("side_pointers.id", ondelete="CASCADE"), nullable=True, index=True
     )
     number: Mapped[str | None] = mapped_column(String(100), nullable=True)
     signed_at: Mapped[date | None] = mapped_column(Date, nullable=True)
@@ -809,9 +887,6 @@ class SupplementaryAgreement(Base):
         DateTime(timezone=True), nullable=True
     )
     decision_comment: Mapped[str | None] = mapped_column(Text, nullable=True)
-    stall_since: Mapped[datetime | None] = mapped_column(
-        DateTime(timezone=True), nullable=True
-    )
     created_at: Mapped[created_at_dt]
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=text("now()"), onupdate=text("now()")

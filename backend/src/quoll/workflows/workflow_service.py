@@ -14,6 +14,7 @@ from quoll.core.exceptions import (
 from quoll.core.locking import lock_row
 from quoll.workflows.graph_policy import StageFacts, edge_facts, graph_problems
 from quoll.workflows.models import Stage, Workflow, WorkflowTransition
+from quoll.workflows.step_handlers import SUPPLEMENTARY_AGREEMENT
 from quoll.workflows.schemas import (
     StageCreate,
     StageUpdate,
@@ -41,7 +42,7 @@ async def check_graph(
     if not (workflow.is_published or full):
         return
     # здесь, а не наверху: модели заявок сами импортируют модели воркфлоу
-    from quoll.interactions.models import Branch, Interaction
+    from quoll.interactions.models import Branch, Interaction, SidePointer, SidePointerStatus
 
     stages = (
         await session.scalars(select(Stage).where(Stage.workflow_id == workflow.id))
@@ -75,6 +76,17 @@ async def check_graph(
             .distinct()
         )
     )
+    occupied |= set(
+        await session.scalars(
+            select(SidePointer.stage_id)
+            .join(Interaction, Interaction.id == SidePointer.interaction_id)
+            .where(
+                Interaction.workflow_id == workflow.id,
+                SidePointer.status == SidePointerStatus.ACTIVE,
+            )
+            .distinct()
+        )
+    )
     problems = graph_problems(
         [
             StageFacts(
@@ -83,7 +95,9 @@ async def check_graph(
                 s.archived_at is not None,
                 s.is_branch_stage,
                 s.is_branch_start,
-                s.is_parallel,
+                s.is_side,
+                s.handler,
+                s.parent_stage_id,
             )
             for s in stages
         ],
@@ -165,15 +179,19 @@ async def create_stage(
             raise DomainRuleException(
                 400, "Parent is a main stage of the same workflow and level"
             )
+        if parent.is_side:
+            raise DomainRuleException(400, "Side stage cannot have sub-steps")
     data = schema.model_dump()
-    if schema.is_parallel and await session.scalar(
+    if schema.handler is not None and await session.scalar(
         select(Stage.id).where(
             Stage.workflow_id == schema.workflow_id,
-            Stage.is_parallel.is_(True),
+            Stage.handler == schema.handler,
             Stage.archived_at.is_(None),
         )
     ):
-        raise DomainRuleException(409, "Workflow already has a parallel stage")
+        raise DomainRuleException(
+            409, f"Workflow already has a stage with handler {schema.handler}"
+        )
     if schema.passive_after_days is not None and not schema.is_branch_stage:
         raise DomainRuleException(400, "Only branch stages are long-term")
     await _check_binds(
@@ -301,8 +319,6 @@ async def _check_reject_to(session: AsyncSession, edge: WorkflowTransition) -> N
         source = (
             await _stage(session, edge.from_stage_id) if edge.from_stage_id else None
         )
-        if stage.is_parallel:
-            raise DomainRuleException(400, "Rejection cannot lead to a parallel stage")
         if stage.is_terminal or (
             source is not None and source.is_branch_stage != stage.is_branch_stage
         ):
@@ -493,7 +509,8 @@ def _fits(target: Stage, archived: Stage) -> bool:
         and target.archived_at is None
         and target.is_terminal == archived.is_terminal
         and target.is_branch_stage == archived.is_branch_stage
-        and target.is_parallel == archived.is_parallel
+        and target.is_side == archived.is_side
+        and target.handler == archived.handler
     )
 
 
@@ -513,6 +530,21 @@ async def _open_agreements(session: AsyncSession, workflow_id: int) -> bool:
                 SupplementaryAgreement.status.in_(
                     [AgreementStatus.DRAFT, AgreementStatus.PENDING]
                 ),
+            )
+            .limit(1)
+        )
+    )
+
+
+async def _active_side_pointers(session: AsyncSession, stage_id: int) -> bool:
+    from quoll.interactions.models import SidePointer, SidePointerStatus
+
+    return bool(
+        await session.scalar(
+            select(SidePointer.id)
+            .where(
+                SidePointer.stage_id == stage_id,
+                SidePointer.status == SidePointerStatus.ACTIVE,
             )
             .limit(1)
         )
@@ -576,9 +608,15 @@ async def archive_stage(
     if archived is None:
         raise DomainRuleException(409, "Stage is already archived")
     await session.refresh(stage)
-    if stage.is_parallel and await _open_agreements(session, workflow.id):
+    if stage.handler == SUPPLEMENTARY_AGREEMENT and await _open_agreements(
+        session, workflow.id
+    ):
         raise DomainRuleException(
             409, "Finish or cancel open supplementary agreements first"
+        )
+    if stage.is_side and await _active_side_pointers(session, stage.id):
+        raise DomainRuleException(
+            409, "Side pointers stand on this stage, finish or cancel them first"
         )
 
     # ветки своих блокировок не имеют - берём их взаимодействия

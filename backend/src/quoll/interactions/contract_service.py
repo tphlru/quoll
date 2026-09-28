@@ -191,7 +191,12 @@ async def open_branches(
     )
     if not approved:
         raise DomainRuleException(409, "Approve at least one branch before signing")
+    # ветка могла встать на начало раньше (ДС через доп. указатель на 4.1
+    # применяет NEW_BRANCH сразу) - на начало ставим и пишем историю только
+    # тем, у кого шага ещё нет (P2-4)
     for branch in approved:
+        if branch.state_id is not None:
+            continue
         branch.state_id = start.id
         branch.opened_at = func.now()
         branch.stall_since = func.now()

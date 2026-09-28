@@ -1,7 +1,7 @@
-"""Жизненный цикл допсоглашения, который трогают чужие модули: возврат в
-черновик при отмене просьбы и отмена при закрытии заявки (П7).
+"""Жизненный цикл допсоглашения, который трогают чужие модули: открытие при
+входе прохождения на шаг 4.1, возврат в черновик, отмена (П7).
 
-листовой модуль - только модели и журнал: его зовут requests и
+листовой модуль - только модели и журнал: его зовут step_hooks и
 transition_service, а они не должны зависеть от sa_service
 """
 
@@ -12,6 +12,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from quoll.auth.audit import record
 from quoll.auth.audit_models import AuditEventType, TargetType
+from quoll.core.exceptions import DomainRuleException
 from quoll.interactions.models import (
     AgreementStatus,
     Interaction,
@@ -19,6 +20,9 @@ from quoll.interactions.models import (
     StageChangeKind,
     SupplementaryAgreement,
 )
+
+# sentinel: cancel_open без pass_id отменяет все незавершённые ДС заявки
+ANY = object()
 
 
 def label(sa: SupplementaryAgreement) -> str:
@@ -35,6 +39,7 @@ def history(
     branch_id: int | None = None,
     from_stage_id: int | None = None,
     to_stage_id: int | None = None,
+    side_pointer_id: int | None = None,
     comment: str | None = None,
 ) -> None:
     """событие истории; у событий заявки без движения - её шаг с обеих сторон"""
@@ -44,6 +49,7 @@ def history(
         InteractionStageHistory(
             interaction_id=interaction.id,
             branch_id=branch_id,
+            side_pointer_id=side_pointer_id,
             from_stage_id=from_stage_id,
             to_stage_id=to_stage_id,
             kind=kind,
@@ -73,43 +79,99 @@ def journal(
     )
 
 
+async def open_for_pass(
+    session: AsyncSession,
+    interaction: Interaction,
+    pass_id: int | None,
+    actor_id: str | None,
+) -> SupplementaryAgreement:
+    """прохождение встало на шаг обработчика - открывается новое ДС (I5).
+
+    незавершённое ДС уже есть - последний рубеж I6 (доп. и основной на 4.1
+    одновременно уже отсечены Д33/Д46, это только страховка)
+    """
+    unfinished = await session.scalar(
+        select(SupplementaryAgreement).where(
+            SupplementaryAgreement.interaction_id == interaction.id,
+            SupplementaryAgreement.status.in_(
+                [AgreementStatus.DRAFT, AgreementStatus.PENDING]
+            ),
+        )
+    )
+    if unfinished is not None:
+        raise DomainRuleException(409, f"Agreement {unfinished.id} is not finished yet")
+    sa = SupplementaryAgreement(
+        interaction_id=interaction.id,
+        side_pointer_id=pass_id,
+        status=AgreementStatus.DRAFT,
+        created_by=actor_id,
+    )
+    session.add(sa)
+    await session.flush()
+    history(
+        session,
+        interaction,
+        StageChangeKind.SA_OPENED,
+        actor_id,
+        payload={"sa_id": sa.id, "side_pointer_id": pass_id},
+        side_pointer_id=pass_id,
+    )
+    journal(session, actor_id, AuditEventType.SA_OPENED, sa)
+    return sa
+
+
 def return_to_draft(
     session: AsyncSession,
     interaction: Interaction,
     sa: SupplementaryAgreement,
     reason: str,
     actor_id: str | None,
+    kind: StageChangeKind = StageChangeKind.SA_RETURNED,
 ) -> None:
-    """просьба об одобрении отменена - ДС снова черновик у КАМа, отсчёт
-    застоя заново: теперь снова его ход"""
+    """просьба об одобрении отменена, отозвана или отклонена - ДС снова
+    черновик. kind - SA_REJECTED при отказе, иначе SA_RETURNED"""
     if sa.status != AgreementStatus.PENDING:
         return
     sa.status = AgreementStatus.DRAFT
-    sa.stall_since = func.now()
     history(
         session,
         interaction,
-        StageChangeKind.SA_RETURNED,
+        kind,
         actor_id,
         payload={"sa_id": sa.id, "reason": reason},
+        side_pointer_id=sa.side_pointer_id,
         comment=reason,
     )
-    journal(session, actor_id, AuditEventType.SA_RETURNED, sa, new={"reason": reason})
+    event = (
+        AuditEventType.SA_REJECTED
+        if kind == StageChangeKind.SA_REJECTED
+        else AuditEventType.SA_RETURNED
+    )
+    journal(session, actor_id, event, sa, new={"reason": reason})
 
 
 async def cancel_open(
-    session: AsyncSession, interaction: Interaction, actor_id: str | None, reason: str
+    session: AsyncSession,
+    interaction: Interaction,
+    actor_id: str | None,
+    reason: str,
+    pass_id: int | None = ANY,
 ) -> None:
-    """заявка закрывается - незавершённое ДС отменяется. Зовут до отмены
-    просьб: тогда ДС не успевает побывать в черновике"""
+    """заявка закрывается или прохождение уходит с шага - незавершённое ДС
+    отменяется. pass_id=ANY (умолчание) - все прохождения; иначе только своё"""
+    conditions = [
+        SupplementaryAgreement.interaction_id == interaction.id,
+        SupplementaryAgreement.status.in_(
+            [AgreementStatus.DRAFT, AgreementStatus.PENDING]
+        ),
+    ]
+    if pass_id is not ANY:
+        conditions.append(
+            SupplementaryAgreement.side_pointer_id.is_not_distinct_from(pass_id)
+        )
     open_agreements = await session.scalars(
         select(SupplementaryAgreement)
-        .where(
-            SupplementaryAgreement.interaction_id == interaction.id,
-            SupplementaryAgreement.status.in_(
-                [AgreementStatus.DRAFT, AgreementStatus.PENDING]
-            ),
-        )
+        .where(*conditions)
         .execution_options(populate_existing=True)
     )
     for sa in open_agreements:
@@ -117,13 +179,13 @@ async def cancel_open(
         sa.decided_by = actor_id
         sa.decided_at = func.now()
         sa.decision_comment = reason
-        sa.stall_since = None
         history(
             session,
             interaction,
             StageChangeKind.SA_CANCELLED,
             actor_id,
             payload={"sa_id": sa.id, "reason": reason},
+            side_pointer_id=sa.side_pointer_id,
             comment=reason,
         )
         journal(

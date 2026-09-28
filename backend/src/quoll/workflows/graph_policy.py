@@ -20,8 +20,10 @@ class StageFacts:
     archived: bool
     branch: bool = False
     branch_start: bool = False
-    # вне цепочки (4.1): без рёбер, без достижимости
-    parallel: bool = False
+    # доп. шаг (4.1): стоит в маршруте линейно, но обычный ход его не занимает
+    side: bool = False
+    handler: str | None = None
+    parent: int | None = None
 
 
 @dataclass(frozen=True)
@@ -29,13 +31,15 @@ class EdgeFacts:
     from_stage_id: int | None
     to_stage_id: int
     irreversible: bool = False
+    backward: bool = False
 
 
 def edge_facts(edges) -> list[EdgeFacts]:
     """активные рёбра графа плюс пути отказа в аппруве (3 -> 3.1): заявка
     попадает туда без ребра, но это законный путь"""
     facts = [
-        EdgeFacts(e.from_stage_id, e.to_stage_id, e.is_irreversible) for e in edges
+        EdgeFacts(e.from_stage_id, e.to_stage_id, e.is_irreversible, e.is_backward)
+        for e in edges
     ]
     facts += [
         EdgeFacts(e.from_stage_id, e.reject_to_stage_id)
@@ -67,15 +71,16 @@ def graph_problems(
     """что не так с графом; пусто - граф проходим. edges - только активные"""
     everything = {s.id: s for s in stages if not s.archived}
     problems = []
-    parallel = {i for i, s in everything.items() if s.parallel}
-    if len(parallel) > 1:
-        problems.append("expected at most one parallel stage")
-    if any(e.from_stage_id in parallel or e.to_stage_id in parallel for e in edges):
-        problems.append("parallel stage has no transitions")
-    if occupied & parallel:
-        problems.append("interactions stand on a parallel stage")
-    # дальше маршрут - без параллельного шага
-    live = {i: s for i, s in everything.items() if i not in parallel}
+    live = dict(everything)
+
+    handlers: dict[str, int] = {}
+    for i, s in live.items():
+        if s.handler:
+            handlers.setdefault(s.handler, 0)
+            handlers[s.handler] += 1
+    for h, count in handlers.items():
+        if count > 1:
+            problems.append(f"expected one stage with handler {h}")
 
     dangling = [
         e
@@ -98,6 +103,8 @@ def graph_problems(
         problems.append("start stage cannot be terminal")
     if any(live[s].branch for s in starts):
         problems.append("start stage cannot be a branch stage")
+    if any(live[s].side for s in starts):
+        problems.append("start stage cannot be a side stage")
 
     # ветки продуктов - свой подграф: свой вход, рёбра границу не пересекают
     branch_starts = [s.id for s in live.values() if s.branch_start]
@@ -124,13 +131,41 @@ def graph_problems(
     if crossing:
         problems.append("transitions cross between contract and branch stages")
     irreversible = [e for e in edges if e.irreversible]
-    if len(irreversible) > 1:
-        problems.append("expected at most one point of no return")
     if branch_starts and any(e.to_stage_id not in branch_starts for e in irreversible):
         problems.append("point of no return leads to the branch start stage")
     if full and branch_starts and not irreversible:
         problems.append("branches need a point of no return into their start")
     starts = [*starts, *branch_starts]
+
+    # доп. стадии: свой выход в основной маршрут, не в терминальную, и если
+    # ведут к точке невозврата - у исходной доп. стадии должен быть живой
+    # родитель уровня заявки, иначе основному указателю некуда вернуться (Д39)
+    side = {i for i, s in live.items() if s.side}
+    main = set(live) - side
+    forward_direct: dict[int, set[int]] = defaultdict(set)
+    for e in edges:
+        if e.from_stage_id in live and e.to_stage_id in live and not e.backward:
+            forward_direct[e.from_stage_id].add(e.to_stage_id)
+    for i in side:
+        if not (_reachable([i], forward_direct) & main):
+            problems.append(f"side stage {i} has no way back to the main route")
+    for e in edges:
+        if e.from_stage_id in side:
+            if e.to_stage_id in live and live[e.to_stage_id].is_terminal:
+                problems.append("side stage cannot lead to a terminal stage")
+            if e.irreversible:
+                parent = live[e.from_stage_id].parent
+                if (
+                    parent is None
+                    or parent not in live
+                    or live[parent].side
+                    or live[parent].is_terminal
+                    or live[parent].branch
+                ):
+                    problems.append(
+                        "side stage leading to the point of no return needs a "
+                        "live main parent"
+                    )
 
     forward: dict[int, set[int]] = defaultdict(set)
     backward: dict[int, set[int]] = defaultdict(set)

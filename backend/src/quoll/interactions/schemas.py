@@ -183,6 +183,8 @@ class StageHistoryRead(AppBaseModel):
     comment: str | None
     # ход ветки продукта; null - ход самого взаимодействия
     branch_id: int | None
+    # прохождение: null - основной указатель, иначе доп.
+    side_pointer_id: int | None
     payload: dict[str, Any]
     created_at: datetime
 
@@ -214,6 +216,8 @@ class RequestCreate(AppBaseModel):
     close_reason_id: int | None = None
     # закрытие подписанной заявки закрывает и открытые ветки - с этой причиной
     branch_close_reason_id: int | None = None
+    # аппрув перехода доп. указателя
+    side_pointer_id: int | None = None
     reason: str = Field(min_length=1)
 
     @model_validator(mode="after")
@@ -241,6 +245,10 @@ class RequestCreate(AppBaseModel):
             raise ValueError(
                 "TRANSITION needs target_stage_id and no target_manager_id"
             )
+        if self.side_pointer_id is not None and (
+            self.kind != "TRANSITION" or self.branch_id is not None
+        ):
+            raise ValueError("Side pass asks only for a transition")
         return self
 
 
@@ -271,7 +279,7 @@ class RequestRead(AppBaseModel):
     branch_id: int | None
     close_reason_id: int | None
     branch_close_reason_id: int | None
-    supplementary_agreement_id: int | None
+    side_pointer_id: int | None
     reason: str
     decided_by: str | None
     decided_at: datetime | None
@@ -293,6 +301,7 @@ class DocumentRead(AppBaseModel):
     contract_signed_at: date | None
     contract_valid_until: date | None
     supplementary_agreement_id: int | None
+    side_pointer_id: int | None
     metadata: dict[str, Any]
     # прежние версии не пропадают, а перестают быть актуальными
     is_current: bool
@@ -370,6 +379,7 @@ class StageValuesWrite(AppBaseModel):
 class StageValuesRead(AppBaseModel):
     stage_id: int
     branch_id: int | None
+    side_pointer_id: int | None
     values: dict[str, Any]
     updated_by: str | None
     updated_at: datetime
@@ -496,7 +506,45 @@ class AgreementRead(AppBaseModel):
     decided_by: str | None
     decided_at: datetime | None
     decision_comment: str | None
-    stall_since: datetime | None
+    side_pointer_id: int | None
     scan_document_id: int | None
     pending_request_id: int | None
     actions: list[AgreementActionRead]
+
+
+# доп. указатель (Д30-Д50)
+
+
+class SidePointerStart(AppBaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    stage_id: int
+    comment: str | None = None
+
+
+class SidePointerTransition(AppBaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    to_stage_id: int
+    expected_state_id: int | None
+    comment: str | None = None
+
+
+class SidePointerCancel(AppBaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    comment: str | None = None
+
+
+class SidePointerRead(AppBaseModel):
+    id: int
+    interaction_id: int
+    branch_id: int | None
+    entry_stage_id: int
+    stage_id: int
+    status: str
+    started_by: str | None
+    started_at: datetime
+    finished_by: str | None
+    finished_at: datetime | None
+    finish_comment: str | None

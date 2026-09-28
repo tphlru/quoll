@@ -28,6 +28,8 @@ from quoll.interactions.models import (
     InteractionStageValues,
     PauseState,
     RequestStatus,
+    SidePointer,
+    SidePointerStatus,
     SlotKind,
     SupplementaryAgreement,
 )
@@ -116,6 +118,10 @@ async def _waiting(session: AsyncSession, interaction_id: int) -> bool:
         select(InteractionDocument.id).where(
             InteractionDocument.interaction_id == interaction_id,
             InteractionDocument.status == DocumentStatus.PENDING,
+        ),
+        select(SidePointer.id).where(
+            SidePointer.interaction_id == interaction_id,
+            SidePointer.status == SidePointerStatus.ACTIVE,
         ),
     ]
     for check in checks:

@@ -1,311 +1,336 @@
 {
-  "name": "Работа с вузами",
-  "description": "Эталонный маршрут: шаги 1–8 по таблице О 2, пороги застоя по Т-3",
-  "warn_days": [
-    60,
-    30
-  ],
-  "stages": [
-    {
-      "key": "contact",
-      "name": "1. Контакт",
-      "position": 1,
-      "stall_days": 14,
-      "fields": [
+    "name": "Работа с вузами",
+    "description": "Эталонный маршрут: шаги 1–8 по таблице О 2, пороги застоя по Т-3",
+    "warn_days": [
+        60,
+        30
+    ],
+    "stages": [
         {
-          "key": "contact",
-          "label": "Контакт вуза",
-          "type": "contact",
-          "required": true
+            "key": "contact",
+            "name": "1. Контакт",
+            "position": 1,
+            "stall_days": 14,
+            "fields": [
+                {
+                    "key": "contact",
+                    "label": "Контакт вуза",
+                    "type": "contact",
+                    "required": true
+                },
+                {
+                    "key": "contact_date",
+                    "label": "Дата",
+                    "type": "date",
+                    "required": true
+                }
+            ]
         },
         {
-          "key": "contact_date",
-          "label": "Дата",
-          "type": "date",
-          "required": true
+            "key": "meeting",
+            "name": "2. Встреча",
+            "position": 2,
+            "stall_days": 14,
+            "fields": [
+                {
+                    "key": "meeting_at",
+                    "label": "Дата и время",
+                    "type": "datetime"
+                }
+            ]
+        },
+        {
+            "key": "documents",
+            "name": "3. Документы",
+            "position": 3,
+            "stall_days": 14
+        },
+        {
+            "key": "correction",
+            "name": "3.1 Корректировка",
+            "position": 4,
+            "stall_days": 14,
+            "parent": "documents"
+        },
+        {
+            "key": "signing",
+            "name": "4. Подписание",
+            "position": 5,
+            "stall_days": 30,
+            "fields": [
+                {
+                    "key": "signed",
+                    "label": "Договор подписан",
+                    "type": "bool",
+                    "required": true,
+                    "bind": "interaction.signed",
+                    "approval_after_pass": true
+                },
+                {
+                    "key": "number",
+                    "label": "Номер договора",
+                    "type": "string",
+                    "bind": "contract.number",
+                    "approval_after_pass": true
+                },
+                {
+                    "key": "signed_on",
+                    "label": "Дата подписания",
+                    "type": "date",
+                    "bind": "contract.signed_at",
+                    "approval_after_pass": true
+                },
+                {
+                    "key": "valid_until",
+                    "label": "Действует до",
+                    "type": "date",
+                    "bind": "contract.valid_until",
+                    "approval_after_pass": true
+                }
+            ]
+        },
+        {
+            "key": "agreement",
+            "name": "4.1 Допсоглашение",
+            "position": 6,
+            "parent": "signing",
+            "stall_days": 30,
+            "side": true,
+            "handler": "SUPPLEMENTARY_AGREEMENT"
+        },
+        {
+            "key": "transfer",
+            "name": "5. Передача",
+            "position": 7,
+            "stall_days": 30,
+            "branch": true,
+            "branch_start": true,
+            "fields": [
+                {
+                    "key": "transfer_status",
+                    "label": "Статус передачи",
+                    "type": "string",
+                    "required": true,
+                    "bind": "branch.transfer_status",
+                    "approval_after_pass": true
+                },
+                {
+                    "key": "transfer_date",
+                    "label": "Дата передачи",
+                    "type": "date"
+                },
+                {
+                    "key": "license_signed_at",
+                    "label": "Дата лицензии",
+                    "type": "date",
+                    "bind": "branch.license_signed_at",
+                    "approval_after_pass": true
+                },
+                {
+                    "key": "license_term_years",
+                    "label": "Срок лицензии, лет",
+                    "type": "number",
+                    "bind": "branch.license_term_years",
+                    "approval_after_pass": true
+                }
+            ]
+        },
+        {
+            "key": "implementation",
+            "name": "6. Внедрение",
+            "position": 8,
+            "stall_days": 60,
+            "passive_after_days": 30,
+            "branch": true,
+            "fields": [
+                {
+                    "key": "launch_date",
+                    "label": "Дата запуска",
+                    "type": "date",
+                    "required": true
+                }
+            ]
+        },
+        {
+            "key": "training",
+            "name": "7. Обучение",
+            "position": 9,
+            "stall_days": 60,
+            "passive_after_days": 30,
+            "branch": true,
+            "fields": [
+                {
+                    "key": "teachers_trained",
+                    "label": "Обучено преподавателей",
+                    "type": "number",
+                    "bind": "branch.teachers_trained"
+                }
+            ]
+        },
+        {
+            "key": "update",
+            "name": "8. Обновление",
+            "position": 10,
+            "passive_after_days": 30,
+            "branch": true
+        },
+        {
+            "key": "done",
+            "name": "Завершено",
+            "position": 11,
+            "terminal": true
+        },
+        {
+            "key": "refused",
+            "name": "Отказ",
+            "position": 12,
+            "terminal": true
+        },
+        {
+            "key": "branch_done",
+            "name": "Ветка завершена",
+            "position": 13,
+            "terminal": true,
+            "branch": true
+        },
+        {
+            "key": "branch_refused",
+            "name": "Ветка: отказ",
+            "position": 14,
+            "terminal": true,
+            "branch": true
         }
-      ]
-    },
-    {
-      "key": "meeting",
-      "name": "2. Встреча",
-      "position": 2,
-      "stall_days": 14,
-      "fields": [
+    ],
+    "transitions": [
         {
-          "key": "meeting_at",
-          "label": "Дата и время",
-          "type": "datetime"
+            "name": "Принять",
+            "to": "contact"
+        },
+        {
+            "name": "К встрече",
+            "from": "contact",
+            "to": "meeting"
+        },
+        {
+            "name": "К документам",
+            "from": "meeting",
+            "to": "documents"
+        },
+        {
+            "name": "На подписание",
+            "from": "documents",
+            "to": "signing",
+            "requires_approval": true,
+            "reject_to": "correction",
+            "required_document_kinds": [
+                "CONTRACT_DRAFT"
+            ]
+        },
+        {
+            "name": "Проект исправлен",
+            "from": "correction",
+            "to": "documents",
+            "required_document_kinds": [
+                "CONTRACT_DRAFT"
+            ]
+        },
+        {
+            "name": "Договор подписан, к передаче",
+            "from": "signing",
+            "to": "transfer",
+            "irreversible": true,
+            "required_document_kinds": [
+                "CONTRACT"
+            ]
+        },
+        {
+            "name": "Завершить",
+            "from": "signing",
+            "to": "done"
+        },
+        {
+            "name": "Передано",
+            "from": "transfer",
+            "to": "implementation",
+            "required_document_kinds": [
+                "TRANSFER_ACT"
+            ]
+        },
+        {
+            "name": "Внедрено",
+            "from": "implementation",
+            "to": "training",
+            "requires_approval": true
+        },
+        {
+            "name": "Обучено",
+            "from": "training",
+            "to": "update"
+        },
+        {
+            "name": "Завершить ветку",
+            "from": "update",
+            "to": "branch_done"
+        },
+        {
+            "name": "Назад к контакту",
+            "from": "meeting",
+            "to": "contact",
+            "backward": true
+        },
+        {
+            "name": "Назад к встрече",
+            "from": "documents",
+            "to": "meeting",
+            "backward": true
+        },
+        {
+            "name": "Назад к передаче",
+            "from": "implementation",
+            "to": "transfer",
+            "backward": true
+        },
+        {
+            "name": "Назад к внедрению",
+            "from": "training",
+            "to": "implementation",
+            "backward": true
+        },
+        {
+            "name": "Назад к обучению",
+            "from": "update",
+            "to": "training",
+            "backward": true
+        },
+        {
+            "name": "Перевнедрение",
+            "from": "update",
+            "to": "implementation",
+            "backward": true
+        },
+        {
+            "name": "Оформить допсоглашение",
+            "from": "signing",
+            "to": "agreement",
+            "required_document_kinds": [
+                "CONTRACT"
+            ]
+        },
+        {
+            "name": "Допсоглашение согласовано, к передаче",
+            "from": "agreement",
+            "to": "transfer",
+            "irreversible": true,
+            "requires_approval": true,
+            "required_document_kinds": [
+                "SUPPLEMENTARY_AGREEMENT"
+            ]
+        },
+        {
+            "name": "Назад к подписанию",
+            "from": "agreement",
+            "to": "signing",
+            "backward": true
         }
-      ]
-    },
-    {
-      "key": "documents",
-      "name": "3. Документы",
-      "position": 3,
-      "stall_days": 14
-    },
-    {
-      "key": "correction",
-      "name": "3.1 Корректировка",
-      "position": 4,
-      "stall_days": 14,
-      "parent": "documents"
-    },
-    {
-      "key": "signing",
-      "name": "4. Подписание",
-      "position": 5,
-      "stall_days": 30,
-      "fields": [
-        {
-          "key": "signed",
-          "label": "Договор подписан",
-          "type": "bool",
-          "required": true,
-          "bind": "interaction.signed",
-          "approval_after_pass": true
-        },
-        {
-          "key": "number",
-          "label": "Номер договора",
-          "type": "string",
-          "bind": "contract.number",
-          "approval_after_pass": true
-        },
-        {
-          "key": "signed_on",
-          "label": "Дата подписания",
-          "type": "date",
-          "bind": "contract.signed_at",
-          "approval_after_pass": true
-        },
-        {
-          "key": "valid_until",
-          "label": "Действует до",
-          "type": "date",
-          "bind": "contract.valid_until",
-          "approval_after_pass": true
-        }
-      ]
-    },
-    {
-      "key": "agreement",
-      "name": "4.1 Допсоглашение",
-      "position": 6,
-      "parallel": true,
-      "parent": "signing",
-      "stall_days": 30
-    },
-    {
-      "key": "transfer",
-      "name": "5. Передача",
-      "position": 7,
-      "stall_days": 30,
-      "branch": true,
-      "branch_start": true,
-      "fields": [
-        {
-          "key": "transfer_status",
-          "label": "Статус передачи",
-          "type": "string",
-          "required": true,
-          "bind": "branch.transfer_status",
-          "approval_after_pass": true
-        },
-        {
-          "key": "transfer_date",
-          "label": "Дата передачи",
-          "type": "date"
-        },
-        {
-          "key": "license_signed_at",
-          "label": "Дата лицензии",
-          "type": "date",
-          "bind": "branch.license_signed_at",
-          "approval_after_pass": true
-        },
-        {
-          "key": "license_term_years",
-          "label": "Срок лицензии, лет",
-          "type": "number",
-          "bind": "branch.license_term_years",
-          "approval_after_pass": true
-        }
-      ]
-    },
-    {
-      "key": "implementation",
-      "name": "6. Внедрение",
-      "position": 8,
-      "stall_days": 60,
-      "passive_after_days": 30,
-      "branch": true,
-      "fields": [
-        {
-          "key": "launch_date",
-          "label": "Дата запуска",
-          "type": "date",
-          "required": true
-        }
-      ]
-    },
-    {
-      "key": "training",
-      "name": "7. Обучение",
-      "position": 9,
-      "stall_days": 60,
-      "passive_after_days": 30,
-      "branch": true,
-      "fields": [
-        {
-          "key": "teachers_trained",
-          "label": "Обучено преподавателей",
-          "type": "number",
-          "bind": "branch.teachers_trained"
-        }
-      ]
-    },
-    {
-      "key": "update",
-      "name": "8. Обновление",
-      "position": 10,
-      "passive_after_days": 30,
-      "branch": true
-    },
-    {
-      "key": "done",
-      "name": "Завершено",
-      "position": 11,
-      "terminal": true
-    },
-    {
-      "key": "refused",
-      "name": "Отказ",
-      "position": 12,
-      "terminal": true
-    },
-    {
-      "key": "branch_done",
-      "name": "Ветка завершена",
-      "position": 13,
-      "terminal": true,
-      "branch": true
-    },
-    {
-      "key": "branch_refused",
-      "name": "Ветка: отказ",
-      "position": 14,
-      "terminal": true,
-      "branch": true
-    }
-  ],
-  "transitions": [
-    {
-      "name": "Принять",
-      "to": "contact"
-    },
-    {
-      "name": "К встрече",
-      "from": "contact",
-      "to": "meeting"
-    },
-    {
-      "name": "К документам",
-      "from": "meeting",
-      "to": "documents"
-    },
-    {
-      "name": "На подписание",
-      "from": "documents",
-      "to": "signing",
-      "requires_approval": true,
-      "reject_to": "correction",
-      "required_document_kinds": [
-        "CONTRACT_DRAFT"
-      ]
-    },
-    {
-      "name": "Проект исправлен",
-      "from": "correction",
-      "to": "documents",
-      "required_document_kinds": [
-        "CONTRACT_DRAFT"
-      ]
-    },
-    {
-      "name": "Договор подписан, к передаче",
-      "from": "signing",
-      "to": "transfer",
-      "irreversible": true,
-      "required_document_kinds": [
-        "CONTRACT"
-      ]
-    },
-    {
-      "name": "Завершить",
-      "from": "signing",
-      "to": "done"
-    },
-    {
-      "name": "Передано",
-      "from": "transfer",
-      "to": "implementation",
-      "required_document_kinds": [
-        "TRANSFER_ACT"
-      ]
-    },
-    {
-      "name": "Внедрено",
-      "from": "implementation",
-      "to": "training",
-      "requires_approval": true
-    },
-    {
-      "name": "Обучено",
-      "from": "training",
-      "to": "update"
-    },
-    {
-      "name": "Завершить ветку",
-      "from": "update",
-      "to": "branch_done"
-    },
-    {
-      "name": "Назад к контакту",
-      "from": "meeting",
-      "to": "contact",
-      "backward": true
-    },
-    {
-      "name": "Назад к встрече",
-      "from": "documents",
-      "to": "meeting",
-      "backward": true
-    },
-    {
-      "name": "Назад к передаче",
-      "from": "implementation",
-      "to": "transfer",
-      "backward": true
-    },
-    {
-      "name": "Назад к внедрению",
-      "from": "training",
-      "to": "implementation",
-      "backward": true
-    },
-    {
-      "name": "Назад к обучению",
-      "from": "update",
-      "to": "training",
-      "backward": true
-    },
-    {
-      "name": "Перевнедрение",
-      "from": "update",
-      "to": "implementation",
-      "backward": true
-    }
-  ]
+    ]
 }

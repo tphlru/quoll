@@ -16,12 +16,10 @@ from sqlalchemy.orm import aliased
 
 from quoll.interactions.bindings import BUSINESS_TZ, current_contract
 from quoll.interactions.models import (
-    AgreementStatus,
     Branch,
     Interaction,
     PauseState,
     SlotKind,
-    SupplementaryAgreement,
 )
 from quoll.interactions.notify import notify
 from quoll.interactions.scope import lock_interaction_scope
@@ -81,37 +79,6 @@ def _branch_stall():
     )
 
 
-def _agreement_stall():
-    """незавершённое ДС: порог - шага 4.1 (§8.6)"""
-    threshold = _threshold(Stage)
-    return (
-        select(
-            SupplementaryAgreement.interaction_id,
-            SupplementaryAgreement.id,
-            SupplementaryAgreement.stall_since,
-            Stage.name,
-            threshold,
-        )
-        .join(Interaction, Interaction.id == SupplementaryAgreement.interaction_id)
-        .join(
-            Stage,
-            and_(
-                Stage.workflow_id == Interaction.workflow_id,
-                Stage.is_parallel.is_(True),
-                Stage.archived_at.is_(None),
-            ),
-        )
-        .where(
-            SupplementaryAgreement.status.in_(
-                [AgreementStatus.DRAFT, AgreementStatus.PENDING]
-            ),
-            Interaction.closed_at.is_(None),
-            Interaction.is_paused.is_(False),
-            _stalled(SupplementaryAgreement.stall_since, threshold),
-        )
-    )
-
-
 def warning_days(days_left: int, warn: list[int]) -> int | None:
     """за сколько дней предупредить сейчас: наименьший подходящий срок, чтобы
     ветка, заведённая за 20 дней до конца, получила одно, а не два"""
@@ -137,8 +104,7 @@ async def _stall_tick(session_maker: async_sessionmaker) -> int:
     async with session_maker() as db:
         interactions = (await db.execute(_interaction_stall())).all()
         branches = (await db.execute(_branch_stall())).all()
-        agreements = (await db.execute(_agreement_stall())).all()
-    candidates = [row[0] for row in (*interactions, *branches, *agreements)]
+    candidates = [row[0] for row in (*interactions, *branches)]
 
     async def handle(db: AsyncSession, scope) -> int:
         sent = 0
@@ -170,18 +136,6 @@ async def _stall_tick(session_maker: async_sessionmaker) -> int:
                 subject_id=branch_id,
                 payload={"branch_id": branch_id},
                 dedup_key=f"stall:branch:{branch_id}:{since.isoformat()}",
-            )
-            sent += 1
-        for _, sa_id, since, stage, days in await db.execute(
-            _agreement_stall().where(SupplementaryAgreement.interaction_id == iid)
-        ):
-            await notify(
-                db,
-                kinds.STALL,
-                scope,
-                context={"branch": "", "stage": stage, "days": days},
-                payload={"sa_id": sa_id},
-                dedup_key=f"stall:sa:{sa_id}:{since.isoformat()}",
             )
             sent += 1
         return sent

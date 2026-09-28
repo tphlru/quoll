@@ -58,15 +58,19 @@ class Stage(Base, IdMixin, TimestampMixin):
             "stall_days IS NULL OR stall_days > 0", name="chk_stage_stall_days"
         ),
         CheckConstraint(
-            "NOT is_parallel OR (NOT is_branch_stage AND NOT is_terminal "
-            "AND NOT is_branch_start)",
-            name="chk_stage_parallel",
+            "NOT is_side OR (NOT is_terminal AND NOT is_branch_start)",
+            name="chk_stage_side",
+        ),
+        CheckConstraint(
+            "handler IS NULL OR (handler <> '' AND is_side AND NOT is_branch_stage)",
+            name="chk_stage_handler",
         ),
         Index(
-            "uq_stages_one_parallel",
+            "uq_stages_handler",
             "workflow_id",
+            "handler",
             unique=True,
-            postgresql_where=text("is_parallel AND archived_at IS NULL"),
+            postgresql_where=text("handler IS NOT NULL AND archived_at IS NULL"),
         ),
         CheckConstraint(
             "passive_after_days IS NULL OR (passive_after_days > 0 AND is_branch_stage)",
@@ -102,10 +106,13 @@ class Stage(Base, IdMixin, TimestampMixin):
     is_branch_start: Mapped[bool] = mapped_column(
         Boolean, default=False, server_default="false"
     )
-    # шаг вне цепочки (4.1 «Допсоглашение»): рёбер нет, на нём никто не стоит
-    is_parallel: Mapped[bool] = mapped_column(
+    # доп. шаг (4.1 «Допсоглашение»): стоит в маршруте линейно, но основной
+    # указатель может его пропустить и вернуться доп. указателем (Д30)
+    is_side: Mapped[bool] = mapped_column(
         Boolean, default=False, server_default="false"
     )
+    # особое поведение доп. шага, код из реестра workflows/step_handlers.py
+    handler: Mapped[str | None] = mapped_column(String(40), nullable=True)
     # поля шага: [{key, label, type, required}] - заполняет менеджер,
     # обязательные проверяются при уходе со стадии вперёд
     fields: Mapped[list[dict[str, Any]]] = mapped_column(

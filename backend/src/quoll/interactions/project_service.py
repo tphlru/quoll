@@ -31,7 +31,6 @@ from quoll.interactions.capacity_policy import (
 )
 from quoll.interactions.close_reasons import check_reason
 from quoll.interactions.models import (
-    AgreementStatus,
     Branch,
     Interaction,
     InteractionAssignment,
@@ -39,7 +38,6 @@ from quoll.interactions.models import (
     PauseState,
     SlotKind,
     StageChangeKind,
-    SupplementaryAgreement,
 )
 from quoll.interactions.notify import notify
 from quoll.interactions.pause_policy import check_pause_term
@@ -397,16 +395,6 @@ async def resume(
         )
         .values(stall_since=func.now())
     )
-    await session.execute(
-        update(SupplementaryAgreement)
-        .where(
-            SupplementaryAgreement.interaction_id == interaction.id,
-            SupplementaryAgreement.status.in_(
-                [AgreementStatus.DRAFT, AgreementStatus.PENDING]
-            ),
-        )
-        .values(stall_since=func.now())
-    )
     _event(session, interaction, StageChangeKind.UNPAUSE, actor_id, None)
     record(
         session,
@@ -590,7 +578,7 @@ async def reopen(
     # архивация этой стадии - наоборот
     requested = await session.get(Stage, to_stage_id)
     if requested is not None and (
-        requested.is_terminal or requested.is_branch_stage or requested.is_parallel
+        requested.is_terminal or requested.is_branch_stage or requested.is_side
     ):
         raise DomainRuleException(400, "Interaction is reopened into a working stage")
     stage = await lock_target_stage(session, to_stage_id)

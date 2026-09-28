@@ -4,19 +4,20 @@
 сервис просьб сам зовёт их - иначе вышел бы круговой импорт
 """
 
-from sqlalchemy import func, update
+from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from quoll.auth.audit import record
 from quoll.auth.audit_models import AuditEventType, TargetType
 from quoll.interactions.models import (
+    AgreementStatus,
     Interaction,
     InteractionRequest,
     InteractionStageValues,
     RequestStatus,
+    StageChangeKind,
     SupplementaryAgreement,
 )
-from quoll.interactions.sa_lifecycle import return_to_draft
 
 
 async def cancel_pending_requests(
@@ -35,8 +36,9 @@ async def cancel_pending_requests(
             decided_at=func.now(),
             decision_comment=reason,
         )
-        .returning(InteractionRequest.id, InteractionRequest.supplementary_agreement_id)
+        .returning(InteractionRequest.id)
     )
+    request_ids = [row[0] for row in cancelled.all()]
     # ждущие правки пройденных шагов устаревают вместе с просьбами
     await session.execute(
         update(InteractionStageValues)
@@ -46,17 +48,23 @@ async def cancel_pending_requests(
         )
         .values(pending_values=None, pending_by=None)
     )
-    rows = cancelled.all()
-    # отменённая просьба об одобрении возвращает ДС в черновик (П7)
-    agreements = [sa_id for _, sa_id in rows if sa_id is not None]
-    if agreements:
+    # ДС в PENDING без ждущих просьб возвращается в черновик (П7)
+    pending_sa = await session.scalar(
+        select(SupplementaryAgreement)
+        .where(
+            SupplementaryAgreement.interaction_id == interaction_id,
+            SupplementaryAgreement.status == AgreementStatus.PENDING,
+        )
+        .execution_options(populate_existing=True)
+    )
+    if pending_sa is not None:
         interaction = await session.get(Interaction, interaction_id)
-        for sa_id in agreements:
-            sa = await session.get(
-                SupplementaryAgreement, sa_id, populate_existing=True
-            )
-            return_to_draft(session, interaction, sa, reason, actor_id)
-    for request_id, _ in rows:
+        from quoll.interactions import sa_lifecycle
+
+        sa_lifecycle.return_to_draft(
+            session, interaction, pending_sa, reason, actor_id, StageChangeKind.SA_RETURNED
+        )
+    for request_id in request_ids:
         record(
             session,
             actor_id=actor_id,

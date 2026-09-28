@@ -1,7 +1,8 @@
-"""Допсоглашение (шаг 4.1, М 3.13, 6.1): черновик, отправка, применение.
+"""Допсоглашение (шаг 4.1, М 3.13, 6.1): данные прохождения обработчика
+SUPPLEMENTARY_AGREEMENT. Открытие, отправка и применение идут через хуки шага
+(step_hooks) - здесь только правила ДС и его действий.
 
-своих блокировок у ДС и действий нет - их прикрывает взаимодействие. Что и
-в каком порядке делается - технический дизайн блока 3
+своих блокировок у ДС и действий нет - их прикрывает взаимодействие
 """
 
 from datetime import date
@@ -32,9 +33,9 @@ from quoll.interactions.models import (
     StageChangeKind,
     SupplementaryAgreement,
 )
-from quoll.interactions.scope import InteractionScope, lock_interaction_scope
-from quoll.interactions.transition_service import share_stage
-from quoll.workflows.models import Stage
+from quoll.interactions.scope import InteractionScope
+from quoll.workflows.models import Stage, WorkflowTransition
+from quoll.workflows.step_handlers import SUPPLEMENTARY_AGREEMENT
 
 OPEN = (AgreementStatus.DRAFT, AgreementStatus.PENDING)
 WITH_BRANCH = (ActionType.EXTEND_LICENSE, ActionType.RESUME, ActionType.EXCLUDE)
@@ -43,12 +44,12 @@ WITH_BRANCH = (ActionType.EXTEND_LICENSE, ActionType.RESUME, ActionType.EXCLUDE)
 # --- общее
 
 
-async def stage41(session: AsyncSession, workflow_id: int | None) -> Stage | None:
+async def handler_stage(session: AsyncSession, workflow_id: int | None) -> Stage | None:
     return await session.scalar(
         select(Stage)
         .where(
             Stage.workflow_id == workflow_id,
-            Stage.is_parallel.is_(True),
+            Stage.handler == SUPPLEMENTARY_AGREEMENT,
             Stage.archived_at.is_(None),
         )
         .execution_options(populate_existing=True)
@@ -78,16 +79,46 @@ async def load(
     return sa
 
 
+async def open_of_pass(
+    session: AsyncSession, interaction_id: int, pass_id: int | None
+) -> SupplementaryAgreement | None:
+    """незавершённое ДС этого прохождения - или None, если его нет"""
+    return await session.scalar(
+        select(SupplementaryAgreement)
+        .where(
+            SupplementaryAgreement.interaction_id == interaction_id,
+            SupplementaryAgreement.side_pointer_id.is_not_distinct_from(pass_id),
+            SupplementaryAgreement.status.in_(OPEN),
+        )
+        .execution_options(populate_existing=True)
+    )
+
+
+async def stage_of(session: AsyncSession, sa: SupplementaryAgreement) -> Stage | None:
+    interaction = await session.get(Interaction, sa.interaction_id)
+    return await handler_stage(session, interaction.workflow_id)
+
+
+async def is_forward_exit(
+    session: AsyncSession, stage: Stage, to_stage_id: int
+) -> bool:
+    return bool(
+        await session.scalar(
+            select(WorkflowTransition.id).where(
+                WorkflowTransition.from_stage_id == stage.id,
+                WorkflowTransition.to_stage_id == to_stage_id,
+                WorkflowTransition.is_active.is_(True),
+                WorkflowTransition.is_backward.is_(False),
+            )
+        )
+    )
+
+
 def require_draft(sa: SupplementaryAgreement) -> None:
     if sa.status != AgreementStatus.DRAFT:
         raise DomainRuleException(
             409, f"Supplementary agreement is {sa.status}, only a draft is changed"
         )
-
-
-def require_owner(scope: InteractionScope) -> None:
-    if scope.interaction.owner_id != scope.actor.id:
-        raise OperationForbiddenException("manage agreements of this interaction")
 
 
 def require_change(scope: InteractionScope) -> None:
@@ -254,53 +285,6 @@ async def _extend_contract_problem(session, interaction, action, others, _branch
 # --- черновик
 
 
-async def open_agreement(
-    session: AsyncSession, *, interaction_id: int, actor_id: str
-) -> SupplementaryAgreement:
-    snapshot = await session.get(Interaction, interaction_id)
-    if snapshot is None:
-        raise IdNotExistsException(Interaction.__name__)
-    step = await stage41(session, snapshot.workflow_id)
-    if step is None:
-        raise DomainRuleException(409, "Workflow has no supplementary agreement step")
-    # шаг 4.1 раньше заявки: его архивация ждёт нас, а не наоборот
-    await share_stage(session, step.id)
-    scope = await lock_interaction_scope(session, interaction_id, actor_id)
-    require_owner(scope)
-    interaction = scope.interaction
-    if interaction.no_return_at is None:
-        raise DomainRuleException(409, "Contract is not signed yet")
-    step = await session.get(Stage, step.id, populate_existing=True)
-    if step.archived_at is not None:
-        raise DomainRuleException(409, "Supplementary agreement step is archived")
-    unfinished = await session.scalar(
-        select(SupplementaryAgreement.id).where(
-            SupplementaryAgreement.interaction_id == interaction.id,
-            SupplementaryAgreement.status.in_(OPEN),
-        )
-    )
-    if unfinished is not None:
-        raise DomainRuleException(409, f"Agreement {unfinished} is not finished yet")
-    sa = SupplementaryAgreement(
-        interaction_id=interaction.id,
-        status=AgreementStatus.DRAFT,
-        created_by=actor_id,
-        stall_since=func.now(),
-    )
-    session.add(sa)
-    await session.flush()
-    sa_lifecycle.history(
-        session,
-        interaction,
-        StageChangeKind.SA_OPENED,
-        actor_id,
-        payload={"sa_id": sa.id},
-    )
-    sa_lifecycle.journal(session, actor_id, AuditEventType.SA_OPENED, sa)
-    await session.refresh(sa)
-    return sa
-
-
 async def update(
     session: AsyncSession,
     *,
@@ -308,8 +292,8 @@ async def update(
     sa_id: int,
     actor_id: str,
     changes: dict[str, Any],
+    scope: InteractionScope,
 ) -> SupplementaryAgreement:
-    scope = await lock_interaction_scope(session, interaction_id, actor_id)
     require_change(scope)
     sa = await load(session, scope.interaction, sa_id)
     require_draft(sa)
@@ -342,8 +326,8 @@ async def add_action(
     sa_id: int,
     actor_id: str,
     fields: dict[str, Any],
+    scope: InteractionScope,
 ) -> AgreementAction:
-    scope = await lock_interaction_scope(session, interaction_id, actor_id)
     require_change(scope)
     sa = await load(session, scope.interaction, sa_id)
     require_draft(sa)
@@ -371,8 +355,8 @@ async def remove_action(
     sa_id: int,
     action_id: int,
     actor_id: str,
+    scope: InteractionScope,
 ) -> None:
-    scope = await lock_interaction_scope(session, interaction_id, actor_id)
     require_change(scope)
     sa = await load(session, scope.interaction, sa_id)
     require_draft(sa)
@@ -390,37 +374,6 @@ async def remove_action(
     )
 
 
-async def cancel(
-    session: AsyncSession,
-    *,
-    interaction_id: int,
-    sa_id: int,
-    actor_id: str,
-    comment: str | None,
-) -> SupplementaryAgreement:
-    scope = await lock_interaction_scope(session, interaction_id, actor_id)
-    require_owner(scope)
-    sa = await load(session, scope.interaction, sa_id)
-    require_draft(sa)
-    sa.status = AgreementStatus.CANCELLED
-    sa.decided_by = actor_id
-    sa.decided_at = func.now()
-    sa.decision_comment = comment
-    sa.stall_since = None
-    sa_lifecycle.history(
-        session,
-        scope.interaction,
-        StageChangeKind.SA_CANCELLED,
-        actor_id,
-        payload={"sa_id": sa.id},
-        comment=comment,
-    )
-    sa_lifecycle.journal(session, actor_id, AuditEventType.SA_CANCELLED, sa)
-    await session.flush()
-    await session.refresh(sa)
-    return sa
-
-
 # --- чтение
 
 
@@ -428,13 +381,15 @@ async def view(session: AsyncSession, sa: SupplementaryAgreement) -> dict[str, A
     scan = await current_scan(session, sa.id)
     pending = await session.scalar(
         select(InteractionRequest.id).where(
-            InteractionRequest.supplementary_agreement_id == sa.id,
+            InteractionRequest.side_pointer_id.is_not_distinct_from(sa.side_pointer_id),
+            InteractionRequest.interaction_id == sa.interaction_id,
             InteractionRequest.status == RequestStatus.PENDING,
         )
     )
     return {
         "id": sa.id,
         "interaction_id": sa.interaction_id,
+        "side_pointer_id": sa.side_pointer_id,
         "number": sa.number,
         "signed_at": sa.signed_at,
         "status": sa.status,
@@ -443,7 +398,6 @@ async def view(session: AsyncSession, sa: SupplementaryAgreement) -> dict[str, A
         "decided_by": sa.decided_by,
         "decided_at": sa.decided_at,
         "decision_comment": sa.decision_comment,
-        "stall_since": sa.stall_since,
         "scan_document_id": scan.id if scan else None,
         "pending_request_id": pending,
         "actions": await actions_of(session, sa.id),
@@ -475,7 +429,8 @@ async def upload_scan(
     interaction = await session.get(Interaction, interaction_id)
     if interaction is None:
         raise IdNotExistsException(Interaction.__name__)
-    step = await stage41(session, interaction.workflow_id)
+    sa = await load(session, interaction, sa_id)
+    step = await handler_stage(session, interaction.workflow_id)
     if step is None:
         raise DomainRuleException(409, "Workflow has no supplementary agreement step")
     return await upload(
@@ -488,20 +443,20 @@ async def upload_scan(
         replaces_document_id=replaces_document_id,
         fields=DocumentFields(kind="SUPPLEMENTARY_AGREEMENT"),
         supplementary_agreement_id=sa_id,
+        side_pointer_id=sa.side_pointer_id,
     )
 
 
-# --- отправка, отзыв, применение
+# --- одобрение
 
 
-async def stages_to_share(session: AsyncSession, sa_id: int) -> set[int]:
+async def stages_to_share(session: AsyncSession, sa: SupplementaryAgreement) -> set[int]:
     """стадии, от которых зависит одобрение: берутся FOR SHARE до области
     заявки (§4). Читаем без блокировок - под областью сверим"""
-    sa = await session.get(SupplementaryAgreement, sa_id)
     interaction = await session.get(Interaction, sa.interaction_id)
     stages: set[int] = set()
     need_start = False
-    for action in await actions_of(session, sa_id):
+    for action in await actions_of(session, sa.id):
         if action.type == ActionType.NEW_BRANCH:
             need_start = True
         elif action.type == ActionType.RESUME:
@@ -514,6 +469,27 @@ async def stages_to_share(session: AsyncSession, sa_id: int) -> set[int]:
         if start is not None:
             stages.add(start.id)
     return stages
+
+
+async def problems(
+    session: AsyncSession, interaction: Interaction, sa: SupplementaryAgreement
+) -> list[str]:
+    """что мешает прямому выходу с шага (скан, каждое действие)"""
+    found = []
+    if await current_scan(session, sa.id) is None:
+        found.append("scan is missing")
+    actions = await actions_of(session, sa.id)
+    for action in actions:
+        others = [a for a in actions if a.id != action.id]
+        if problem := await action_problem(session, interaction, action, others):
+            found.append(f"action {action.id}: {problem}")
+    return found
+
+
+async def submit(session: AsyncSession, sa: SupplementaryAgreement) -> None:
+    """создана просьба TRANSITION с шага ДС - DRAFT -> PENDING"""
+    sa.status = AgreementStatus.PENDING
+    sa_lifecycle.journal(session, sa.created_by, AuditEventType.SA_SUBMITTED, sa)
 
 
 async def stale_actions(
@@ -533,110 +509,6 @@ async def stale_actions(
     return None
 
 
-async def submit(
-    session: AsyncSession,
-    *,
-    interaction_id: int,
-    sa_id: int,
-    actor_id: str,
-    comment: str | None,
-) -> SupplementaryAgreement:
-    from quoll.auth.audit import record
-    from quoll.auth.audit_models import TargetType
-    from quoll.interactions.notify import notify
-    from quoll.notifications import kinds
-    from quoll.notifications.kinds import Subject
-
-    scope = await lock_interaction_scope(session, interaction_id, actor_id)
-    require_owner(scope)
-    interaction = scope.interaction
-    sa = await load(session, interaction, sa_id)
-    require_draft(sa)
-    problems = []
-    if await current_scan(session, sa.id) is None:
-        problems.append("scan is missing")
-    actions = await actions_of(session, sa.id)
-    for action in actions:
-        others = [a for a in actions if a.id != action.id]
-        if problem := await action_problem(session, interaction, action, others):
-            problems.append(f"action {action.id}: {problem}")
-    # номер и дата не нужны (Д20)
-    if problems:
-        raise DomainRuleException(409, "Agreement is not ready: " + "; ".join(problems))
-    reason = comment or "на одобрение"
-    request = InteractionRequest(
-        interaction_id=interaction.id,
-        kind="SA_APPROVAL",
-        supplementary_agreement_id=sa.id,
-        requested_by=actor_id,
-        from_owner_id=interaction.owner_id,
-        reason=reason,
-    )
-    session.add(request)
-    sa.status = AgreementStatus.PENDING
-    await session.flush()
-    record(
-        session,
-        actor_id=actor_id,
-        event_type=AuditEventType.SA_SUBMITTED,
-        target_type=TargetType.REQUEST,
-        target_id=request.id,
-        new_value={"sa_id": sa.id},
-    )
-    await notify(
-        session,
-        kinds.REQUEST_CREATED,
-        scope,
-        context={"request": "допсоглашение", "reason": reason},
-        subject=Subject.REQUEST,
-        subject_id=request.id,
-        payload={"request_id": request.id, "sa_id": sa.id},
-    )
-    await session.refresh(sa)
-    return sa
-
-
-async def recall(
-    session: AsyncSession, *, interaction_id: int, sa_id: int, actor_id: str
-) -> SupplementaryAgreement:
-    from quoll.auth.audit import record
-    from quoll.auth.audit_models import TargetType
-    from quoll.core.locking import lock_row
-
-    scope = await lock_interaction_scope(session, interaction_id, actor_id)
-    require_owner(scope)
-    sa = await load(session, scope.interaction, sa_id)
-    if sa.status != AgreementStatus.PENDING:
-        raise DomainRuleException(409, f"Supplementary agreement is {sa.status}")
-    request_id = await session.scalar(
-        select(InteractionRequest.id).where(
-            InteractionRequest.supplementary_agreement_id == sa.id,
-            InteractionRequest.status == RequestStatus.PENDING,
-        )
-    )
-    if request_id is not None:
-        request = await lock_row(session, InteractionRequest, request_id)
-        request.status = RequestStatus.CANCELLED
-        request.decided_by = actor_id
-        request.decided_at = func.now()
-        request.decision_comment = "recalled by author"
-        record(
-            session,
-            actor_id=actor_id,
-            event_type=AuditEventType.REQUEST_CANCELLED,
-            target_type=TargetType.REQUEST,
-            target_id=request_id,
-            new_value={"reason": "recalled by author"},
-        )
-    # просьбы нет - нарушение I4, чиним: ДС всё равно в черновик
-    sa_lifecycle.return_to_draft(
-        session, scope.interaction, sa, "recalled by author", actor_id
-    )
-    await session.flush()
-    await session.refresh(sa)
-    return sa
-
-
 _ORDER = {
     ActionType.NEW_BRANCH: 0,
     ActionType.RESUME: 1,
@@ -650,20 +522,19 @@ _ORDER = {
 async def apply(
     session: AsyncSession,
     scope: InteractionScope,
-    sa_id: int,
-    actor_id: str,
+    sa: SupplementaryAgreement,
+    actor_id: str | None,
     comment: str | None,
     shared: set[int],
 ) -> None:
     """одобрение: все действия одной транзакцией (I5). shared - стадии, на
-    которые approve взял FOR SHARE до области; под областью их не блокируем"""
+    которые взяли FOR SHARE до области; под областью их не блокируем"""
     from quoll.auth.audit import record
     from quoll.auth.audit_models import TargetType
     from quoll.interactions.branch_service import close_locked
     from quoll.interactions.close_reasons import id_by_code
 
     interaction = scope.interaction
-    sa = await session.get(SupplementaryAgreement, sa_id, populate_existing=True)
     actions = sorted(
         await actions_of(session, sa.id),
         key=lambda a: (_ORDER[ActionType(a.type)], a.id),
@@ -833,34 +704,13 @@ async def apply(
     sa.decided_by = actor_id
     sa.decided_at = func.now()
     sa.decision_comment = comment
-    sa.stall_since = None
     sa_lifecycle.history(
         session,
         interaction,
         StageChangeKind.SA_APPROVED,
         actor_id,
         payload={"sa_id": sa.id, "actions": [a.id for a in actions]},
+        side_pointer_id=sa.side_pointer_id,
     )
+    sa_lifecycle.journal(session, actor_id, AuditEventType.SA_APPROVED, sa)
     await session.flush()
-
-
-def reject(
-    session: AsyncSession,
-    interaction: Interaction,
-    sa: SupplementaryAgreement,
-    actor_id: str,
-    comment: str | None,
-) -> None:
-    sa.status = AgreementStatus.REJECTED
-    sa.decided_by = actor_id
-    sa.decided_at = func.now()
-    sa.decision_comment = comment
-    sa.stall_since = None
-    sa_lifecycle.history(
-        session,
-        interaction,
-        StageChangeKind.SA_REJECTED,
-        actor_id,
-        payload={"sa_id": sa.id},
-        comment=comment,
-    )
