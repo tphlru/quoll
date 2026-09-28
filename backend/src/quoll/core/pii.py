@@ -2,7 +2,9 @@
 строка, ключ - в окружении, отдельно от базы. Несколько ключей через
 запятую - ротация: шифрует первый, читает любой"""
 
+import json
 from functools import cache
+from typing import Any
 
 from cryptography.fernet import Fernet, MultiFernet
 from sqlalchemy import Text
@@ -32,3 +34,22 @@ class EncryptedString(TypeDecorator):
         if value is None:
             return None
         return _fernet().decrypt(value.encode()).decode()
+
+
+class EncryptedJSON(TypeDecorator):
+    """JSON, который в базе лежит зашифрованным целиком: партия импорта
+    хранит ячейки файла, а в них бывают ПДн (M6). Искать по нему нельзя"""
+
+    impl = Text
+    cache_ok = True
+
+    def process_bind_param(self, value: Any, dialect) -> str | None:
+        if value is None:
+            return None
+        raw = json.dumps(value, ensure_ascii=False, default=str)
+        return _fernet().encrypt(raw.encode()).decode()
+
+    def process_result_value(self, value: str | None, dialect) -> Any:
+        if value is None:
+            return None
+        return json.loads(_fernet().decrypt(value.encode()).decode())

@@ -53,6 +53,14 @@ class Settings(BaseSettings):
     # по умолчанию у движка 5 + 10: предпросмотр держит два соединения
     db_pool_size: int = 20
     db_max_overflow: int = 10
+    # импорт: пределы только для него, у вложений свои
+    import_max_size_mb: int = 10
+    import_max_rows: int = 10000
+    import_max_registry_rows: int = 2000
+    import_draft_ttl_hours: int = 24
+    import_applied_ttl_days: int = 7
+    import_worker_interval_seconds: int = 2
+    import_cleanup_interval_seconds: int = 3600
 
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8")
 

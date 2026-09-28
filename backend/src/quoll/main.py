@@ -22,6 +22,7 @@ from quoll.interactions import (
     interactions_router,
     requests_router,
 )
+from quoll.imports import imports_router
 from quoll.jobs import background_jobs
 from quoll.notifications import router as notifications_router
 from quoll.notifications import ws_router as notifications_ws_router
@@ -104,7 +105,9 @@ async def lifespan(app: FastAPI):
     reports = ReportRunner(
         app.state.db_session_maker, app.state.s3, settings.report_render_processes
     )
-    workers = Workers(background_jobs(app.state.db_session_maker, reports))
+    workers = Workers(
+        background_jobs(app.state.db_session_maker, reports, app.state.s3)
+    )
     if settings.workers_enabled:
         workers.start()
     logger.info("Application started")
@@ -200,6 +203,7 @@ app.include_router(org_router)
 app.include_router(catalog_router)
 app.include_router(admin_router)
 app.include_router(reports_router)
+app.include_router(imports_router)
 app.include_router(notifications_router)
 app.include_router(notifications_ws_router)
 

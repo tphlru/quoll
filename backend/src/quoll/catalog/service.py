@@ -67,7 +67,7 @@ async def create(
     model: type[Base],
     target: TargetType,
     data: BaseModel,
-    actor_id: str,
+    actor_id: str | None,
 ) -> Base:
     fields, links = _split(model, data.model_dump())
     item = model(**fields)
@@ -92,7 +92,7 @@ async def update(
     target: TargetType,
     item_id: int,
     changes: BaseModel | dict[str, Any],
-    actor_id: str,
+    actor_id: str | None,
 ) -> Base:
     new = (
         changes if isinstance(changes, dict) else changes.model_dump(exclude_unset=True)

@@ -581,6 +581,10 @@ class InteractionDocument(Base):
             "contract_signed_at IS NULL AND contract_valid_until IS NULL)",
             name="chk_document_contract_fields",
         ),
+        CheckConstraint(
+            "attachment_id IS NOT NULL OR kind = 'CONTRACT'",
+            name="chk_document_file_or_contract",
+        ),
         # у версии один преемник - иначе цепочка раздвоится
         Index(
             "uq_documents_replaces",
@@ -594,9 +598,10 @@ class InteractionDocument(Base):
     interaction_id: Mapped[int] = mapped_column(
         ForeignKey("interactions.id", ondelete="CASCADE"), index=True
     )
-    # документ без файла бессмыслен, и одно вложение - один документ
-    attachment_id: Mapped[int] = mapped_column(
-        ForeignKey("attachments.id", ondelete="CASCADE"), unique=True
+    # одно вложение - один документ. Без файла - только договор из импорта
+    # (В1): скан потом приходит новой версией
+    attachment_id: Mapped[int | None] = mapped_column(
+        ForeignKey("attachments.id", ondelete="CASCADE"), unique=True, nullable=True
     )
     stage_id: Mapped[int] = mapped_column(ForeignKey("stages.id", ondelete="RESTRICT"))
     uploaded_by: Mapped[str | None] = mapped_column(

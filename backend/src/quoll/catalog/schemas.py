@@ -4,6 +4,7 @@ from typing import Annotated, ClassVar, Literal
 from pydantic import AfterValidator, ConfigDict, Field, model_validator
 
 from quoll.catalog.regions import REGIONS
+from quoll.core import validators
 from quoll.core.schemas import AppBaseModel
 
 
@@ -198,31 +199,14 @@ class UniversitySpecialtiesWrite(_Write):
     specialty_ids: list[int]
 
 
-def _inn(value: str) -> str:
-    """ИНН юрлица: 10 цифр и контрольная цифра"""
-    if not (value.isdigit() and len(value) == 10):
-        raise ValueError("INN must be 10 digits")
-    weights = (2, 4, 10, 3, 5, 9, 4, 6, 8)
-    check = sum(int(d) * w for d, w in zip(value, weights, strict=False)) % 11 % 10
-    if check != int(value[9]):
-        raise ValueError("INN checksum does not match")
-    return value
-
-
-def _kpp(value: str | None) -> str | None:
-    if value is not None and not (value.isdigit() and len(value) == 9):
-        raise ValueError("KPP must be 9 digits")
-    return value
-
-
 def _region(value: str | None) -> str | None:
     if value is not None and value not in REGIONS:
         raise ValueError("Region must be a subject of the Russian Federation")
     return value
 
 
-Inn = Annotated[str, AfterValidator(_inn)]
-Kpp = Annotated[str | None, AfterValidator(_kpp)]
+Inn = Annotated[str, AfterValidator(validators.inn)]
+Kpp = Annotated[str | None, AfterValidator(validators.kpp)]
 Region = Annotated[str, AfterValidator(_region)]
 
 
@@ -240,7 +224,7 @@ class UniversityPatch(_Patch):
     required = ("full_name", "short_name", "inn", "region", "city")
     full_name: str | None = Field(default=None, min_length=1)
     short_name: str | None = Field(default=None, min_length=1, max_length=255)
-    inn: Annotated[str | None, AfterValidator(lambda v: v and _inn(v))] = None
+    inn: Annotated[str | None, AfterValidator(lambda v: v and validators.inn(v))] = None
     kpp: Kpp = None
     site: str | None = Field(default=None, max_length=255)
     region: Annotated[str | None, AfterValidator(_region)] = None

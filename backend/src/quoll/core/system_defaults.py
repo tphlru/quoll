@@ -29,3 +29,14 @@ class SystemDefaults:
     REPORT_XLS_MAX_ROWS = 65_521
     REPORT_PDF_MAX_ROWS = 5_000
     REPORT_FILE_TTL_HOURS = 24
+
+    # импорт: аренда применения продлевается на каждой единице
+    IMPORT_LEASE_SECONDS = 120
+    # попытки единицы при неожиданном сбое, потом FAILED - партия не застревает
+    IMPORT_UNIT_ATTEMPTS = 3
+    # отложенные взятия при недоступном Keycloak: 30 с x 2^n, не больше 30 мин
+    IMPORT_IDP_RETRIES = 10
+    IMPORT_IDP_BACKOFF_SECONDS = 30
+    IMPORT_IDP_BACKOFF_MAX_SECONDS = 1800
+    # пауза перед повтором единицы после сбоя
+    IMPORT_UNIT_RETRY_SECONDS = 30
