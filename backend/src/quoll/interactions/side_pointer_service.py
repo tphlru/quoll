@@ -22,6 +22,7 @@ from quoll.interactions import step_hooks
 from quoll.interactions.access_policy import can_change
 from quoll.interactions.models import (
     Branch,
+    DocumentStatus,
     Interaction,
     InteractionDocument,
     InteractionRequest,
@@ -48,40 +49,22 @@ from quoll.workflows.models import Stage, Workflow, WorkflowTransition
 def segment(
     edges: list[EdgeFacts], stages_by_id: dict[int, Stage], entry_id: int
 ) -> tuple[set[int], list[EdgeFacts]]:
-    """доп. стадии сегмента входа entry_id и его выходы - активные прямые
-    рёбра из сегмента в стадию не-доп."""
-    forward: dict[int, set[int]] = {}
-    for e in edges:
-        if e.from_stage_id is not None and stages_by_id.get(
-            e.from_stage_id
-        ) and stages_by_id[e.from_stage_id].is_side:
-            forward.setdefault(e.from_stage_id, set())
-            if e.to_stage_id in stages_by_id and stages_by_id[e.to_stage_id].is_side:
-                forward[e.from_stage_id].add(e.to_stage_id)
-    members: set[int] = set()
-    todo = [entry_id]
-    while todo:
-        stage_id = todo.pop()
-        if stage_id in members:
-            continue
-        members.add(stage_id)
-        todo.extend(forward.get(stage_id, set()) - members)
+    """доп. стадии сегмента входа entry_id (достижимые по рёбрам между доп.
+    стадиями) и его выходы - прямые рёбра из сегмента в стадию не-доп."""
+    side = {i for i, s in stages_by_id.items() if s.is_side}
+    inner = [e for e in edges if e.from_stage_id in side and e.to_stage_id in side]
+    members = {i for i in side if i == entry_id or leads_to(inner, entry_id, i)}
     exits = [
         e
         for e in edges
-        if e.from_stage_id in members
-        and not e.backward
-        and (e.to_stage_id not in stages_by_id or not stages_by_id[e.to_stage_id].is_side)
+        if e.from_stage_id in members and e.to_stage_id not in side and not e.backward
     ]
     return members, exits
 
 
 def return_points(exits: list[EdgeFacts], stages_by_id: dict[int, Stage]) -> set[int]:
-    return {
-        e.to_stage_id
-        for e in exits
-        if not stages_by_id[e.to_stage_id].is_terminal
-    }
+    """нетерминальные цели выходов (Д33)"""
+    return {e.to_stage_id for e in exits if not stages_by_id[e.to_stage_id].is_terminal}
 
 
 async def positions(session: AsyncSession, interaction: Interaction) -> set[int]:
@@ -98,10 +81,10 @@ async def positions(session: AsyncSession, interaction: Interaction) -> set[int]
     return result
 
 
-def passed(forward_edges: list[EdgeFacts], point: int, current_positions: set[int]) -> bool:
-    return any(
-        p == point or leads_to(forward_edges, point, p) for p in current_positions
-    )
+def passed(edges: list[EdgeFacts], point: int, current_positions: set[int]) -> bool:
+    """основной указатель прошёл точку: стоит на ней или дальше по прямым рёбрам"""
+    forward = [e for e in edges if not e.backward]
+    return any(p == point or leads_to(forward, point, p) for p in current_positions)
 
 
 async def _graph(
@@ -134,7 +117,9 @@ async def _active(session: AsyncSession, interaction_id: int) -> SidePointer | N
     )
 
 
-async def load_active(session: AsyncSession, interaction_id: int, pointer_id: int) -> SidePointer:
+async def load_active(
+    session: AsyncSession, interaction_id: int, pointer_id: int
+) -> SidePointer:
     pointer = await session.get(SidePointer, pointer_id, populate_existing=True)
     if pointer is None or pointer.interaction_id != interaction_id:
         raise IdNotExistsException(SidePointer.__name__)
@@ -143,19 +128,32 @@ async def load_active(session: AsyncSession, interaction_id: int, pointer_id: in
     return pointer
 
 
-async def passed_segment(session: AsyncSession, interaction: Interaction, stage: Stage) -> bool:
-    """Д46: все точки возврата сегмента входа stage уже пройдены основным"""
-    forward, stages_by_id = await _graph(session, interaction.workflow_id)
-    members, exits = segment(forward, stages_by_id, stage.id)
+async def _return_points(
+    session: AsyncSession, interaction: Interaction, entry: Stage
+) -> tuple[set[int], bool]:
+    """точки возврата сегмента входа entry и прошёл ли основной их все (Д33)"""
+    edges, stages_by_id = await _graph(session, interaction.workflow_id)
+    _, exits = segment(edges, stages_by_id, entry.id)
     points = return_points(exits, stages_by_id)
-    if not points:
-        return False
-    current_positions = await positions(session, interaction)
-    return all(passed(forward, p, current_positions) for p in points)
+    current = await positions(session, interaction)
+    return points, all(passed(edges, p, current) for p in points)
+
+
+async def passed_segment(
+    session: AsyncSession, interaction: Interaction, stage: Stage
+) -> bool:
+    """Д46: все точки возврата сегмента входа stage уже пройдены основным"""
+    points, all_passed = await _return_points(session, interaction, stage)
+    return bool(points) and all_passed
 
 
 async def start(
-    session: AsyncSession, *, interaction_id: int, actor_id: str, stage_id: int, comment: str | None
+    session: AsyncSession,
+    *,
+    interaction_id: int,
+    actor_id: str,
+    stage_id: int,
+    comment: str | None,
 ) -> SidePointer:
     await share_stage(session, stage_id)
     scope = await lock_interaction_scope(session, interaction_id, actor_id)
@@ -169,7 +167,9 @@ async def start(
         raise WorkflowNotPublishedException(interaction.workflow_id)
     entry = (
         await session.execute(
-            select(Stage).where(Stage.id == stage_id).execution_options(populate_existing=True)
+            select(Stage)
+            .where(Stage.id == stage_id)
+            .execution_options(populate_existing=True)
         )
     ).scalar_one_or_none()
     if entry is None or entry.workflow_id != interaction.workflow_id:
@@ -181,54 +181,49 @@ async def start(
     if entry.is_branch_stage:
         raise DomainRuleException(409, "Side steps of branches are not supported yet")
 
-    forward, stages_by_id = await _graph(session, interaction.workflow_id)
-    entered = False
-    # входное ребро проверяем по модели: requires_approval не входит в EdgeFacts
-    real_edges = list(
+    # вход - по любому ребру из основной стадии, прошедшему её проверки на
+    # значениях и файлах основного прохождения (Д49); ответ - по первому
+    entry_edges = list(
         await session.scalars(
-            select(WorkflowTransition).where(
-                WorkflowTransition.workflow_id == interaction.workflow_id,
+            select(WorkflowTransition)
+            .join(Stage, Stage.id == WorkflowTransition.from_stage_id)
+            .where(
                 WorkflowTransition.to_stage_id == entry.id,
                 WorkflowTransition.is_active.is_(True),
-                WorkflowTransition.is_backward.is_(False),
+                Stage.is_side.is_(False),
             )
+            .order_by(WorkflowTransition.id)
         )
     )
-    real_edges = [
-        e
-        for e in real_edges
-        if e.from_stage_id is not None and not stages_by_id[e.from_stage_id].is_side
-    ]
-    if not real_edges:
+    if not entry_edges:
         raise DomainRuleException(400, "Stage is not an entry of side steps")
-    last_error = None
-    for edge in real_edges:
+    problems = []
+    for edge in entry_edges:
         if edge.requires_approval:
-            last_error = "Side pointer cannot enter through a transition needing approval"
+            problems.append(
+                "Side pointer cannot enter through a transition needing approval"
+            )
             continue
-        source = stages_by_id[edge.from_stage_id]
+        source = await session.get(Stage, edge.from_stage_id)
         try:
-            await check_step(session, interaction, source, edge, approved=False, side_pointer_id=None)
+            await check_step(session, interaction, source, edge, approved=False)
         except DomainRuleException as err:
-            last_error = err.message
+            problems.append(err.message)
             continue
-        entered = True
         break
-    if not entered:
-        raise DomainRuleException(409, last_error or "Step is not done")
+    else:
+        raise DomainRuleException(409, problems[0])
 
     active = await _active(session, interaction.id)
     if active is not None:
         raise DomainRuleException(409, f"Side pointer {active.id} is already active")
-
-    members, exits = segment(forward, stages_by_id, entry.id)
-    points = return_points(exits, stages_by_id)
+    points, all_passed = await _return_points(session, interaction, entry)
     if not points:
         raise DomainRuleException(409, "Side steps have no way back to the main route")
-    current_positions = await positions(session, interaction)
-    if not all(passed(forward, p, current_positions) for p in points):
+    if not all_passed:
         raise DomainRuleException(
-            409, "Main route has not passed these steps yet, move the interaction itself"
+            409,
+            "Main route has not passed these steps yet, move the interaction itself",
         )
 
     pointer = SidePointer(
@@ -285,7 +280,13 @@ async def move(
     if pointer.stage_id != expected_state_id:
         raise StaleStateException("Side pointer stage", pointer.stage_id)
     return await move_locked(
-        session, scope, pointer, to_stage_id, comment, approved=False, shared={to_stage_id} | pre
+        session,
+        scope,
+        pointer,
+        to_stage_id,
+        comment,
+        approved=False,
+        shared={to_stage_id} | pre,
     )
 
 
@@ -298,10 +299,10 @@ async def move_locked(
     *,
     approved: bool,
     shared: set[int],
-    actor_id: str | None = None,
 ) -> SidePointer:
+    """ход под уже захваченной областью - его зовёт и одобрение просьбы"""
     interaction = scope.interaction
-    actor_id = actor_id or scope.actor.id
+    actor_id = scope.actor.id
     if to_stage_id == pointer.stage_id:
         raise DomainRuleException(409, "Side pointer is already on this stage")
     current = await session.get(Stage, pointer.stage_id)
@@ -313,20 +314,33 @@ async def move_locked(
         raise DomainRuleException(409, "No active transition between these stages")
     if edge.is_backward and not comment:
         raise DomainRuleException(422, "Backward transition needs a comment")
-    await check_step(session, interaction, current, edge, approved=approved, side_pointer_id=pointer.id)
+    await check_step(
+        session,
+        interaction,
+        current,
+        edge,
+        approved=approved,
+        side_pointer_id=pointer.id,
+    )
 
     if not target.is_side:
         if edge.is_backward:
             raise DomainRuleException(
                 409, "Side pointer leaves only forward; cancel it instead"
             )
-        await step_hooks.leave(session, scope, current, edge, pointer.id, shared, actor_id, comment)
+        await step_hooks.leave(
+            session, scope, current, edge, pointer.id, shared, actor_id, comment
+        )
         await _finish(session, pointer, actor_id, comment, edge, target)
     else:
         if edge.is_backward:
-            await step_hooks.abandon(session, scope, current, pointer.id, comment or "", actor_id)
+            await step_hooks.abandon(
+                session, scope, current, pointer.id, comment or "", actor_id
+            )
         else:
-            await step_hooks.leave(session, scope, current, edge, pointer.id, shared, actor_id, comment)
+            await step_hooks.leave(
+                session, scope, current, edge, pointer.id, shared, actor_id, comment
+            )
         pointer.stage_id = target.id
         session.add(
             InteractionStageHistory(
@@ -401,17 +415,22 @@ async def _finish(
         target_id=pointer.interaction_id,
         new_value={"side_pointer_id": pointer.id, "stage_id": pointer.stage_id},
     )
-    await _quiet(session, pointer, comment)
+    await _quiet(session, pointer, comment or "side pass finished")
 
 
 async def cancel(
-    session: AsyncSession, *, interaction_id: int, pointer_id: int, actor_id: str, comment: str | None
+    session: AsyncSession,
+    *,
+    interaction_id: int,
+    pointer_id: int,
+    actor_id: str,
+    comment: str | None,
 ) -> SidePointer:
     scope = await lock_interaction_scope(session, interaction_id, actor_id)
     if not can_change(scope.actor, scope.ownership):
         raise OperationForbiddenException("cancel a side pointer of this interaction")
     pointer = await load_active(session, interaction_id, pointer_id)
-    return await cancel_locked(session, scope, pointer, comment or "cancelled", actor_id=actor_id)
+    return await cancel_locked(session, scope, pointer, comment or "cancelled")
 
 
 async def cancel_locked(
@@ -419,10 +438,9 @@ async def cancel_locked(
     scope: InteractionScope,
     pointer: SidePointer,
     reason: str,
-    *,
-    actor_id: str | None = None,
 ) -> SidePointer:
-    actor_id = actor_id if actor_id is not None else (scope.actor.id if scope.actor else None)
+    """зовут отмена, закрытие заявки и переход в терминальную"""
+    actor_id = scope.actor.id if scope.actor else None
     stage = await session.get(Stage, pointer.stage_id)
     await step_hooks.abandon(session, scope, stage, pointer.id, reason, actor_id)
     await _quiet(session, pointer, reason)
@@ -491,19 +509,22 @@ async def _quiet(session: AsyncSession, pointer: SidePointer, reason: str) -> No
         await session.scalars(
             select(InteractionDocument).where(
                 InteractionDocument.side_pointer_id == pointer.id,
-                InteractionDocument.status == "PENDING",
+                InteractionDocument.status == DocumentStatus.PENDING,
             )
         )
     )
     for doc in docs:
-        doc.status = "REJECTED"
+        doc.status = DocumentStatus.REJECTED
+        # отклонённая выходит из цепочки версий, как в document_service.decide
         doc.replaces_document_id = None
 
 
-async def cancel_active(session: AsyncSession, scope: InteractionScope, reason: str) -> None:
+async def cancel_active(
+    session: AsyncSession, scope: InteractionScope, reason: str
+) -> None:
     pointer = await _active(session, scope.interaction.id)
     if pointer is not None:
-        await cancel_locked(session, scope, pointer, reason, actor_id=None)
+        await cancel_locked(session, scope, pointer, reason)
 
 
 async def listing(session: AsyncSession, interaction_id: int) -> list[SidePointer]:

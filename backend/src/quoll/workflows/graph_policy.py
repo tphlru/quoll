@@ -8,7 +8,7 @@
 вызывающий передаёт его как ребро
 """
 
-from collections import defaultdict
+from collections import Counter, defaultdict
 from collections.abc import Iterable
 from dataclasses import dataclass
 
@@ -69,18 +69,13 @@ def graph_problems(
     full: bool,
 ) -> list[str]:
     """что не так с графом; пусто - граф проходим. edges - только активные"""
-    everything = {s.id: s for s in stages if not s.archived}
+    live = {s.id: s for s in stages if not s.archived}
     problems = []
-    live = dict(everything)
 
-    handlers: dict[str, int] = {}
-    for i, s in live.items():
-        if s.handler:
-            handlers.setdefault(s.handler, 0)
-            handlers[s.handler] += 1
-    for h, count in handlers.items():
-        if count > 1:
-            problems.append(f"expected one stage with handler {h}")
+    handlers = Counter(s.handler for s in live.values() if s.handler)
+    problems += [
+        f"expected one stage with handler {h}" for h, n in handlers.items() if n > 1
+    ]
 
     dangling = [
         e

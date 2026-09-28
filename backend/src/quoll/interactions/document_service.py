@@ -36,8 +36,6 @@ from quoll.interactions.models import (
     DocumentStatus,
     Interaction,
     InteractionDocument,
-    SidePointer,
-    SidePointerStatus,
     SupplementaryAgreement,
 )
 from quoll.interactions.notify import notify
@@ -105,28 +103,18 @@ async def upload(
             raise OperationForbiddenException("attach documents to this interaction")
         pointer = None
         if side_pointer_id is not None:
-            pointer = await session.get(SidePointer, side_pointer_id)
-            if pointer is None or pointer.interaction_id != interaction_id:
-                raise DomainRuleException(404, "Side pointer is not in this interaction")
-            if pointer.status != SidePointerStatus.ACTIVE:
-                raise DomainRuleException(409, "Side pass is finished")
-            if branch_id is not None:
-                raise DomainRuleException(
-                    400, "Side pass of the interaction has no branch values"
-                )
-            stage = await session.get(Stage, stage_id)
-            if not stage.is_side:
-                raise DomainRuleException(400, "Side pass fills side steps only")
-            if fields.kind in CONTRACT_DOCUMENT_KINDS:
-                raise DomainRuleException(
-                    400, "Contract changes only through agreement actions"
-                )
+            pointer = await contract_service.active_pass(
+                session, interaction_id, side_pointer_id
+            )
+            contract_service.check_side_target(
+                await session.get(Stage, stage_id), branch_id
+            )
         previous = None
         if replaces_document_id is not None:
             previous = await _check_replaceable(
                 session, interaction_id, replaces_document_id
             )
-            if pointer is not None and previous.side_pointer_id != side_pointer_id:
+            if previous.side_pointer_id != side_pointer_id:
                 raise DomainRuleException(400, "New version stays in its pass")
             # версия живёт на стадии прежней или на её подшаге (Д6) - иначе
             # замена из текущего шага обошла бы аппрув правки пройденного
@@ -149,6 +137,11 @@ async def upload(
             branch_id,
             for_agreement=supplementary_agreement_id is not None,
         )
+        # вид мог прийти и от заменяемой версии
+        if pointer is not None and values.kind in CONTRACT_DOCUMENT_KINDS:
+            raise DomainRuleException(
+                400, "Contract changes only through agreement actions"
+            )
         current = scope.interaction.state_id
         if branch_id is not None:
             branch = await session.get(Branch, branch_id)
@@ -160,14 +153,18 @@ async def upload(
                 )
             current = branch.state_id
         # правка файла пройденного шага - с аппрувом руководителя (AS IS);
-        # скан допсоглашения одобряют вместе с ним; доп. прохождение - без аппрува
-        pending = (
-            pointer is None
-            and supplementary_agreement_id is None
-            and actor.role == UserRole.MANAGER
-            and contract_service.step_passed(
+        # скан допсоглашения одобряют вместе с ним. У доп. прохождения
+        # пройден любой его шаг, кроме текущего
+        if pointer is not None:
+            passed = stage_id != pointer.stage_id
+        else:
+            passed = contract_service.step_passed(
                 scope.interaction, stage_id, current, branch_id
             )
+        pending = (
+            supplementary_agreement_id is None
+            and actor.role == UserRole.MANAGER
+            and passed
         )
         if not pending and values.kind == "CONTRACT":
             values = await _keep_extended_term(session, interaction_id, values)
@@ -482,6 +479,10 @@ async def decide(
     )
     if document.status != DocumentStatus.PENDING:
         raise DomainRuleException(409, f"Document is already {document.status}")
+    if document.side_pointer_id is not None:
+        await contract_service.active_pass(
+            session, document.interaction_id, document.side_pointer_id
+        )
     if approve:
         if document.kind == "CONTRACT":
             await _keep_extended_term(session, document.interaction_id, document)

@@ -33,7 +33,7 @@ from quoll.interactions.models import (
     StageChangeKind,
     SupplementaryAgreement,
 )
-from quoll.interactions.scope import InteractionScope
+from quoll.interactions.scope import InteractionScope, lock_interaction_scope
 from quoll.workflows.models import Stage, WorkflowTransition
 from quoll.workflows.step_handlers import SUPPLEMENTARY_AGREEMENT
 
@@ -292,8 +292,8 @@ async def update(
     sa_id: int,
     actor_id: str,
     changes: dict[str, Any],
-    scope: InteractionScope,
 ) -> SupplementaryAgreement:
+    scope = await lock_interaction_scope(session, interaction_id, actor_id)
     require_change(scope)
     sa = await load(session, scope.interaction, sa_id)
     require_draft(sa)
@@ -326,8 +326,8 @@ async def add_action(
     sa_id: int,
     actor_id: str,
     fields: dict[str, Any],
-    scope: InteractionScope,
 ) -> AgreementAction:
+    scope = await lock_interaction_scope(session, interaction_id, actor_id)
     require_change(scope)
     sa = await load(session, scope.interaction, sa_id)
     require_draft(sa)
@@ -355,8 +355,8 @@ async def remove_action(
     sa_id: int,
     action_id: int,
     actor_id: str,
-    scope: InteractionScope,
 ) -> None:
+    scope = await lock_interaction_scope(session, interaction_id, actor_id)
     require_change(scope)
     sa = await load(session, scope.interaction, sa_id)
     require_draft(sa)
@@ -379,11 +379,19 @@ async def remove_action(
 
 async def view(session: AsyncSession, sa: SupplementaryAgreement) -> dict[str, Any]:
     scan = await current_scan(session, sa.id)
+    # ждущий выход этого прохождения с шага ДС
     pending = await session.scalar(
-        select(InteractionRequest.id).where(
-            InteractionRequest.side_pointer_id.is_not_distinct_from(sa.side_pointer_id),
+        select(InteractionRequest.id)
+        .join(
+            WorkflowTransition,
+            WorkflowTransition.id == InteractionRequest.transition_id,
+        )
+        .join(Stage, Stage.id == WorkflowTransition.from_stage_id)
+        .where(
             InteractionRequest.interaction_id == sa.interaction_id,
+            InteractionRequest.side_pointer_id.is_not_distinct_from(sa.side_pointer_id),
             InteractionRequest.status == RequestStatus.PENDING,
+            Stage.handler == SUPPLEMENTARY_AGREEMENT,
         )
     )
     return {
@@ -450,7 +458,9 @@ async def upload_scan(
 # --- одобрение
 
 
-async def stages_to_share(session: AsyncSession, sa: SupplementaryAgreement) -> set[int]:
+async def stages_to_share(
+    session: AsyncSession, sa: SupplementaryAgreement
+) -> set[int]:
     """стадии, от которых зависит одобрение: берутся FOR SHARE до области
     заявки (§4). Читаем без блокировок - под областью сверим"""
     interaction = await session.get(Interaction, sa.interaction_id)
@@ -486,10 +496,11 @@ async def problems(
     return found
 
 
-async def submit(session: AsyncSession, sa: SupplementaryAgreement) -> None:
+def submit(session: AsyncSession, sa: SupplementaryAgreement, actor_id: str) -> None:
     """создана просьба TRANSITION с шага ДС - DRAFT -> PENDING"""
+    require_draft(sa)
     sa.status = AgreementStatus.PENDING
-    sa_lifecycle.journal(session, sa.created_by, AuditEventType.SA_SUBMITTED, sa)
+    sa_lifecycle.journal(session, actor_id, AuditEventType.SA_SUBMITTED, sa)
 
 
 async def stale_actions(
@@ -704,13 +715,13 @@ async def apply(
     sa.decided_by = actor_id
     sa.decided_at = func.now()
     sa.decision_comment = comment
-    sa_lifecycle.history(
+    await sa_lifecycle.pass_history(
         session,
         interaction,
         StageChangeKind.SA_APPROVED,
         actor_id,
+        sa,
         payload={"sa_id": sa.id, "actions": [a.id for a in actions]},
-        side_pointer_id=sa.side_pointer_id,
     )
     sa_lifecycle.journal(session, actor_id, AuditEventType.SA_APPROVED, sa)
     await session.flush()

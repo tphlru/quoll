@@ -20,6 +20,8 @@ from quoll.interactions.models import (
     Interaction,
     InteractionStageHistory,
     PauseState,
+    SidePointer,
+    SidePointerStatus,
     StageChangeKind,
 )
 from quoll.interactions.scope import InteractionScope, lock_interaction_scope
@@ -234,6 +236,28 @@ def step_passed(
     if stage_id != current:
         return True
     return branch_id is None and interaction.no_return_at is not None
+
+
+async def active_pass(
+    session: AsyncSession, interaction_id: int, side_pointer_id: int
+) -> SidePointer:
+    """доп. прохождение, в которое пишут: завершённое - только чтение (Д41)"""
+    pointer = await session.get(SidePointer, side_pointer_id, populate_existing=True)
+    if pointer is None or pointer.interaction_id != interaction_id:
+        raise DomainRuleException(404, "Side pointer is not in this interaction")
+    if pointer.status != SidePointerStatus.ACTIVE:
+        raise DomainRuleException(409, "Side pass is finished")
+    return pointer
+
+
+def check_side_target(stage: Stage, branch_id: int | None) -> None:
+    """доп. прохождение заявки заполняет только доп. шаги и без веток"""
+    if branch_id is not None:
+        raise DomainRuleException(
+            400, "Side pass of the interaction has no branch values"
+        )
+    if not stage.is_side:
+        raise DomainRuleException(400, "Side pass fills side steps only")
 
 
 def unpause_branch(branch: Branch) -> None:

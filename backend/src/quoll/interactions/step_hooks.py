@@ -4,6 +4,8 @@
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from quoll.core.exceptions import DomainRuleException
+from quoll.interactions.models import StageChangeKind
 from quoll.interactions.scope import InteractionScope
 from quoll.workflows.models import Stage, WorkflowTransition
 from quoll.workflows.step_handlers import SUPPLEMENTARY_AGREEMENT
@@ -14,7 +16,6 @@ async def enter(
     scope: InteractionScope,
     stage: Stage,
     pass_id: int | None,
-    *,
     actor_id: str | None,
 ) -> None:
     """прохождение встало на стадию: переход, возврат при отказе, откат, start"""
@@ -36,15 +37,12 @@ async def check_leave(
         from quoll.interactions import sa_service
 
         sa = await sa_service.open_of_pass(session, scope.interaction.id, pass_id)
-        problems = await sa_service.problems(session, scope.interaction, sa)
-        if problems:
-            raise_ready_problem(problems)
-
-
-def raise_ready_problem(problems: list[str]) -> None:
-    from quoll.core.exceptions import DomainRuleException
-
-    raise DomainRuleException(409, "Agreement is not ready: " + "; ".join(problems))
+        if sa is None:
+            raise DomainRuleException(409, "Agreement is not ready: it is not open")
+        if problems := await sa_service.problems(session, scope.interaction, sa):
+            raise DomainRuleException(
+                409, "Agreement is not ready: " + "; ".join(problems)
+            )
 
 
 async def leave(
@@ -53,11 +51,11 @@ async def leave(
     stage: Stage,
     edge: WorkflowTransition,
     pass_id: int | None,
-    shared: set[int],
+    shared: set[int] | frozenset[int],
     actor_id: str | None,
     comment: str | None,
 ) -> None:
-    """прямой выход состоялся (после check_step)"""
+    """прямой выход состоялся (после check_step): ДС применяется"""
     if stage.handler == SUPPLEMENTARY_AGREEMENT:
         from quoll.interactions import sa_service
 
@@ -75,7 +73,7 @@ async def abandon(
     actor_id: str | None,
 ) -> None:
     """прохождение ушло с шага без выхода вперёд: обратное ребро, возврат,
-    откат, отмена доп. указателя, закрытие"""
+    откат, отмена доп. указателя"""
     if stage.handler == SUPPLEMENTARY_AGREEMENT:
         from quoll.interactions import sa_lifecycle
 
@@ -87,31 +85,34 @@ async def abandon(
 async def pre_share(
     session: AsyncSession, interaction_id: int, pass_id: int | None, to_stage_id: int
 ) -> set[int]:
-    """до блокировки области, без блокировок"""
+    """стадии для FOR SHARE до области, без блокировок: незавершённое ДС
+    прохождения есть только на его шаге (I5), нужны лишь при прямом выходе"""
     from quoll.interactions import sa_service
-    from quoll.interactions.models import AgreementStatus
 
     sa = await sa_service.open_of_pass(session, interaction_id, pass_id)
-    if sa is None or sa.status != AgreementStatus.DRAFT:
+    if sa is None:
         return set()
     stage = await sa_service.stage_of(session, sa)
-    if stage is None:
-        return set()
-    is_forward_exit = await sa_service.is_forward_exit(session, stage, to_stage_id)
-    if not is_forward_exit:
+    if stage is None or not await sa_service.is_forward_exit(
+        session, stage, to_stage_id
+    ):
         return set()
     return await sa_service.stages_to_share(session, sa)
 
 
 async def submitted(
-    session: AsyncSession, scope: InteractionScope, stage: Stage, pass_id: int | None
+    session: AsyncSession,
+    scope: InteractionScope,
+    stage: Stage,
+    pass_id: int | None,
+    actor_id: str,
 ) -> None:
     """создана просьба TRANSITION с этого шага"""
     if stage.handler == SUPPLEMENTARY_AGREEMENT:
         from quoll.interactions import sa_service
 
         sa = await sa_service.open_of_pass(session, scope.interaction.id, pass_id)
-        await sa_service.submit(session, sa)
+        sa_service.submit(session, sa, actor_id)
 
 
 async def returned(
@@ -119,13 +120,15 @@ async def returned(
     scope: InteractionScope,
     pass_id: int | None,
     reason: str,
-    kind: str,
-    *,
-    actor_id: str | None = None,
+    kind: StageChangeKind,
+    actor_id: str | None,
 ) -> None:
-    """просьба с шага отклонена, отозвана или отменена"""
+    """просьба с шага обработчика отклонена, отозвана или отменена - зовут
+    только для таких. kind - SA_REJECTED при отказе, иначе SA_RETURNED"""
     from quoll.interactions import sa_lifecycle, sa_service
 
     sa = await sa_service.open_of_pass(session, scope.interaction.id, pass_id)
     if sa is not None:
-        sa_lifecycle.return_to_draft(session, scope.interaction, sa, reason, actor_id, kind)
+        await sa_lifecycle.return_to_draft(
+            session, scope.interaction, sa, reason, actor_id, kind
+        )

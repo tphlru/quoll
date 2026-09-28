@@ -18,6 +18,7 @@ from quoll.interactions.models import (
     StageChangeKind,
     SupplementaryAgreement,
 )
+from quoll.interactions.sa_lifecycle import return_to_draft
 
 
 async def cancel_pending_requests(
@@ -59,10 +60,13 @@ async def cancel_pending_requests(
     )
     if pending_sa is not None:
         interaction = await session.get(Interaction, interaction_id)
-        from quoll.interactions import sa_lifecycle
-
-        sa_lifecycle.return_to_draft(
-            session, interaction, pending_sa, reason, actor_id, StageChangeKind.SA_RETURNED
+        await return_to_draft(
+            session,
+            interaction,
+            pending_sa,
+            reason,
+            actor_id,
+            StageChangeKind.SA_RETURNED,
         )
     for request_id in request_ids:
         record(

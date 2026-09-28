@@ -17,6 +17,7 @@ from quoll.interactions.models import (
     AgreementStatus,
     Interaction,
     InteractionStageHistory,
+    SidePointer,
     StageChangeKind,
     SupplementaryAgreement,
 )
@@ -57,6 +58,34 @@ def history(
             comment=comment,
             payload=payload,
         )
+    )
+
+
+async def pass_history(
+    session: AsyncSession,
+    interaction: Interaction,
+    kind: StageChangeKind,
+    actor_id: str | None,
+    sa: SupplementaryAgreement,
+    *,
+    payload: dict[str, Any],
+    comment: str | None = None,
+) -> None:
+    """событие ДС: у доп. прохождения с обеих сторон - шаг указателя, а не
+    заявки (§3.6)"""
+    stage_id = interaction.state_id
+    if sa.side_pointer_id is not None:
+        stage_id = (await session.get(SidePointer, sa.side_pointer_id)).stage_id
+    history(
+        session,
+        interaction,
+        kind,
+        actor_id,
+        payload=payload,
+        from_stage_id=stage_id,
+        to_stage_id=stage_id,
+        side_pointer_id=sa.side_pointer_id,
+        comment=comment,
     )
 
 
@@ -108,19 +137,19 @@ async def open_for_pass(
     )
     session.add(sa)
     await session.flush()
-    history(
+    await pass_history(
         session,
         interaction,
         StageChangeKind.SA_OPENED,
         actor_id,
+        sa,
         payload={"sa_id": sa.id, "side_pointer_id": pass_id},
-        side_pointer_id=pass_id,
     )
     journal(session, actor_id, AuditEventType.SA_OPENED, sa)
     return sa
 
 
-def return_to_draft(
+async def return_to_draft(
     session: AsyncSession,
     interaction: Interaction,
     sa: SupplementaryAgreement,
@@ -133,13 +162,13 @@ def return_to_draft(
     if sa.status != AgreementStatus.PENDING:
         return
     sa.status = AgreementStatus.DRAFT
-    history(
+    await pass_history(
         session,
         interaction,
         kind,
         actor_id,
+        sa,
         payload={"sa_id": sa.id, "reason": reason},
-        side_pointer_id=sa.side_pointer_id,
         comment=reason,
     )
     event = (
@@ -179,13 +208,13 @@ async def cancel_open(
         sa.decided_by = actor_id
         sa.decided_at = func.now()
         sa.decision_comment = reason
-        history(
+        await pass_history(
             session,
             interaction,
             StageChangeKind.SA_CANCELLED,
             actor_id,
+            sa,
             payload={"sa_id": sa.id, "reason": reason},
-            side_pointer_id=sa.side_pointer_id,
             comment=reason,
         )
         journal(

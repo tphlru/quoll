@@ -91,10 +91,12 @@ async def move_locked(
     comment: str | None,
     approved: bool,
     new_work: bool = False,
-    shared: frozenset = frozenset(),
+    shared: set[int] | frozenset[int] = frozenset(),
 ) -> Interaction:
     """переход по ребру под уже захваченной областью - его зовёт и одобрение
-    просьбы об аппруве. approved - ребро с аппрувом разрешено"""
+    просьбы об аппруве. approved - ребро с аппрувом разрешено. shared - стадии,
+    взятые FOR SHARE до области (выход с шага ДС)"""
+    # ленивый: side_pointer_service сам импортирует этот модуль
     from quoll.interactions import side_pointer_service
 
     interaction = scope.interaction
@@ -134,12 +136,18 @@ async def move_locked(
     if edge.is_backward and not comment:
         raise DomainRuleException(422, "Backward transition needs a comment")
     await check_step(session, interaction, current, edge, approved=approved)
-    await _check_contract_rules(session, interaction, current, edge, target, workflow_id)
+    await _check_contract_rules(
+        session, interaction, current, edge, target, workflow_id
+    )
     if current is not None and current.handler:
         if edge.is_backward:
-            await step_hooks.abandon(session, scope, current, None, comment or "", actor_id)
+            await step_hooks.abandon(
+                session, scope, current, None, comment or "", actor_id
+            )
         else:
-            await step_hooks.leave(session, scope, current, edge, None, shared, actor_id, comment)
+            await step_hooks.leave(
+                session, scope, current, edge, None, shared, actor_id, comment
+            )
     if edge.is_irreversible:
         await contract_service.open_branches(session, interaction, actor_id)
         if target.is_branch_stage:
@@ -264,10 +272,18 @@ async def check_step(
     values, kinds = {}, set()
     if current is not None:
         values = await stage_values(
-            session, interaction.id, current.id, branch_id, side_pointer_id=side_pointer_id
+            session,
+            interaction.id,
+            current.id,
+            branch_id,
+            side_pointer_id=side_pointer_id,
         )
         kinds = await current_document_kinds(
-            session, interaction.id, current.id, branch_id, side_pointer_id=side_pointer_id
+            session,
+            interaction.id,
+            current.id,
+            branch_id,
+            side_pointer_id=side_pointer_id,
         )
     problems = transition_problems(
         requires_approval=edge.requires_approval,
@@ -298,7 +314,9 @@ async def stage_values(
             InteractionStageValues.interaction_id == interaction_id,
             InteractionStageValues.stage_id == stage_id,
             InteractionStageValues.branch_id.is_not_distinct_from(branch_id),
-            InteractionStageValues.side_pointer_id.is_not_distinct_from(side_pointer_id),
+            InteractionStageValues.side_pointer_id.is_not_distinct_from(
+                side_pointer_id
+            ),
         )
     )
     # привязанные поля - из колонок, см. bindings.py
@@ -472,7 +490,9 @@ async def return_locked(
         )
         await assert_can_keep_working(session, scope.owner, delta)
     if current is not None and current.handler:
-        await step_hooks.abandon(session, scope, current, None, comment or "", scope.actor.id)
+        await step_hooks.abandon(
+            session, scope, current, None, comment or "", scope.actor.id
+        )
     place(
         session,
         interaction,
@@ -573,6 +593,8 @@ async def close_locked(
     branch_close_reason_id: int | None = None,
 ) -> Interaction:
     """закрытие под уже захваченной областью - его зовёт и одобрение просьбы"""
+    from quoll.interactions import side_pointer_service
+
     interaction = scope.interaction
     actor_id = scope.actor.id
     if not can_close(scope.actor, scope.ownership):
@@ -609,8 +631,6 @@ async def close_locked(
         comment,
         branch_reason.id if branch_reason else None,
     )
-    from quoll.interactions import side_pointer_service
-
     interaction.close_reason_id = reason.id
     # до place: в SA_CANCELLED попадёт шаг, с которого закрыли; до отмены
     # просьб: ДС не успеет побывать в черновике

@@ -12,7 +12,7 @@ from quoll.auth.dependencies import (
 from quoll.auth.models import User, UserRole
 from quoll.core import SystemDefaults
 from quoll.core.exceptions import DomainRuleException
-from quoll.workflows import change_requests, workflow_service
+from quoll.workflows import change_requests, step_handlers, workflow_service
 from quoll.workflows.dependencies import (
     SessionDep,
     StageRepoDep,
@@ -22,6 +22,7 @@ from quoll.workflows.dependencies import (
 from quoll.workflows.schemas import (
     StageArchiveRequest,
     StageCreate,
+    StageHandlerRead,
     StageRead,
     StageUpdate,
     StartStageRequest,
@@ -181,6 +182,18 @@ async def get_stages_by_workflow(
     workflow_id: int = Path(..., ge=1, description="Workflow ID"),
 ):
     return await repo.get_by_workflow_id(workflow_id)
+
+
+@stages_router.get(
+    "/handlers",
+    response_model=list[StageHandlerRead],
+    summary="Special behaviours a side stage can have",
+)
+async def list_stage_handlers():
+    return [
+        StageHandlerRead(code=code, label=label)
+        for code, label in step_handlers.HANDLERS.items()
+    ]
 
 
 @stages_router.get(

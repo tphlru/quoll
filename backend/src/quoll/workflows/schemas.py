@@ -5,6 +5,7 @@ from pydantic import AfterValidator, ConfigDict, Field, model_validator
 
 from quoll.attachments.schemas import AttachmentRead
 from quoll.core.schemas import AppBaseModel
+from quoll.workflows import step_handlers
 
 
 # Stage
@@ -92,9 +93,8 @@ class StageCreate(StageBase):
 
     @model_validator(mode="after")
     def check_handler_known(self):
-        from quoll.workflows.step_handlers import HANDLERS
-
-        if self.handler is not None and self.handler not in HANDLERS:
+        # реестр читается в момент вызова - тесты могут его подменить
+        if self.handler is not None and self.handler not in step_handlers.HANDLERS:
             raise ValueError(f"Unknown stage handler '{self.handler}'")
         return self
 
@@ -123,6 +123,11 @@ class StageRead(StageBase):
     archived_at: datetime | None = None
     created_at: datetime
     updated_at: datetime
+
+
+class StageHandlerRead(AppBaseModel):
+    code: str
+    label: str
 
 
 class StageArchiveRequest(AppBaseModel):

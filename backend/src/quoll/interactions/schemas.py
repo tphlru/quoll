@@ -489,12 +489,6 @@ class AgreementUpdate(AppBaseModel):
     signed_at: date | None = None
 
 
-class AgreementComment(AppBaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    comment: str | None = None
-
-
 class AgreementRead(AppBaseModel):
     id: int
     interaction_id: int

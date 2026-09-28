@@ -37,6 +37,7 @@ from quoll.interactions import (
     project_service,
     request_service,
     sa_service,
+    side_pointer_service,
     slots,
     step_service,
     transition_service,
@@ -54,7 +55,6 @@ from quoll.interactions.schemas import (
     AcceptRequest,
     AgreementActionRead,
     AgreementActionWrite,
-    AgreementComment,
     AgreementRead,
     AgreementUpdate,
     AssignRequest,
@@ -80,6 +80,10 @@ from quoll.interactions.schemas import (
     RequestRead,
     RequestReject,
     RollbackRequest,
+    SidePointerCancel,
+    SidePointerRead,
+    SidePointerStart,
+    SidePointerTransition,
     StageValuesRead,
     StageValuesWrite,
     TransitionRequest,
@@ -320,6 +324,7 @@ async def create_request(
         branch_id=body.branch_id,
         close_reason_id=body.close_reason_id,
         branch_close_reason_id=body.branch_close_reason_id,
+        side_pointer_id=body.side_pointer_id,
     )
 
 
@@ -351,6 +356,7 @@ def _document(view) -> DocumentRead:
         contract_signed_at=doc.contract_signed_at,
         contract_valid_until=doc.contract_valid_until,
         supplementary_agreement_id=doc.supplementary_agreement_id,
+        side_pointer_id=doc.side_pointer_id,
         metadata=doc.meta,
         is_current=view.is_current,
         replaced_by_id=view.replaced_by.id if view.replaced_by else None,
@@ -385,6 +391,8 @@ async def attach_document(
     replaces_document_id: Annotated[int | None, Form()] = None,
     # файл шага ветки продукта
     branch_id: Annotated[int | None, Form()] = None,
+    # файл доп. прохождения
+    side_pointer_id: Annotated[int | None, Form()] = None,
     title: Annotated[str | None, Form(max_length=255)] = None,
     # вид из справочника; у новой версии можно не указывать
     kind: Annotated[str | None, Form(max_length=50)] = None,
@@ -404,6 +412,7 @@ async def attach_document(
         stage_id=stage_id,
         replaces_document_id=replaces_document_id,
         branch_id=branch_id,
+        side_pointer_id=side_pointer_id,
         fields=document_service.DocumentFields(
             kind=kind,
             title=title,
@@ -533,17 +542,6 @@ async def list_agreements(interaction: ReadableInteraction, session: SessionDep)
     return await sa_service.listing(session, interaction.id)
 
 
-@interactions_router.post(
-    SA,
-    response_model=AgreementRead,
-    status_code=status.HTTP_201_CREATED,
-    summary="The manager opens a supplementary agreement after signing (step 4.1)",
-)
-async def open_agreement(id: InteractionId, user: CurrentUser, session: SessionDep):
-    sa = await sa_service.open_agreement(session, interaction_id=id, actor_id=user.id)
-    return await sa_service.view(session, sa)
-
-
 @interactions_router.patch(SA + "/{sa_id}", response_model=AgreementRead)
 async def update_agreement(
     id: InteractionId,
@@ -626,46 +624,74 @@ async def upload_agreement_scan(
     return _document(view)
 
 
+SP = "/{id}/side-pointers"
+
+
 @interactions_router.post(
-    SA + "/{sa_id}/submit",
-    response_model=AgreementRead,
-    summary="Send the agreement to the owner's supervisor for approval",
+    SP,
+    response_model=SidePointerRead,
+    status_code=status.HTTP_201_CREATED,
+    summary="Send a side pointer through side steps the main route has passed",
 )
-async def submit_agreement(
+async def start_side_pointer(
+    id: InteractionId, body: SidePointerStart, user: CurrentUser, session: SessionDep
+):
+    return await side_pointer_service.start(
+        session,
+        interaction_id=id,
+        actor_id=user.id,
+        stage_id=body.stage_id,
+        comment=body.comment,
+    )
+
+
+@interactions_router.get(SP, response_model=list[SidePointerRead])
+async def list_side_pointers(interaction: ReadableInteraction, session: SessionDep):
+    return await side_pointer_service.listing(session, interaction.id)
+
+
+@interactions_router.post(
+    SP + "/{pointer_id}/transition",
+    response_model=SidePointerRead,
+    summary="Move a side pointer; a forward edge to the main route finishes it",
+)
+async def move_side_pointer(
     id: InteractionId,
-    sa_id: int,
-    body: AgreementComment,
+    pointer_id: int,
+    body: SidePointerTransition,
     user: CurrentUser,
     session: SessionDep,
 ):
-    sa = await sa_service.submit(
-        session, interaction_id=id, sa_id=sa_id, actor_id=user.id, comment=body.comment
+    return await side_pointer_service.move(
+        session,
+        interaction_id=id,
+        pointer_id=pointer_id,
+        actor_id=user.id,
+        to_stage_id=body.to_stage_id,
+        expected_state_id=body.expected_state_id,
+        comment=body.comment,
     )
-    return await sa_service.view(session, sa)
 
 
-@interactions_router.post(SA + "/{sa_id}/recall", response_model=AgreementRead)
-async def recall_agreement(
-    id: InteractionId, sa_id: int, user: CurrentUser, session: SessionDep
-):
-    sa = await sa_service.recall(
-        session, interaction_id=id, sa_id=sa_id, actor_id=user.id
-    )
-    return await sa_service.view(session, sa)
-
-
-@interactions_router.post(SA + "/{sa_id}/cancel", response_model=AgreementRead)
-async def cancel_agreement(
+@interactions_router.post(
+    SP + "/{pointer_id}/cancel",
+    response_model=SidePointerRead,
+    summary="Cancel a side pointer; its open agreement and requests are cancelled",
+)
+async def cancel_side_pointer(
     id: InteractionId,
-    sa_id: int,
-    body: AgreementComment,
+    pointer_id: int,
+    body: SidePointerCancel,
     user: CurrentUser,
     session: SessionDep,
 ):
-    sa = await sa_service.cancel(
-        session, interaction_id=id, sa_id=sa_id, actor_id=user.id, comment=body.comment
+    return await side_pointer_service.cancel(
+        session,
+        interaction_id=id,
+        pointer_id=pointer_id,
+        actor_id=user.id,
+        comment=body.comment,
     )
-    return await sa_service.view(session, sa)
 
 
 @interactions_router.get(
@@ -703,6 +729,7 @@ async def put_stage_values(
     user: CurrentUser,
     session: SessionDep,
     branch_id: int | None = None,
+    side_pointer_id: int | None = None,
 ):
     row = await step_service.set_values(
         session,
@@ -711,6 +738,7 @@ async def put_stage_values(
         values=body.values,
         actor_id=user.id,
         branch_id=branch_id,
+        side_pointer_id=side_pointer_id,
     )
     return await step_service.view(session, row)
 
@@ -726,6 +754,7 @@ async def approve_stage_values(
     user: CurrentUser,
     session: SessionDep,
     branch_id: int | None = None,
+    side_pointer_id: int | None = None,
 ):
     row = await step_service.decide(
         session,
@@ -734,6 +763,7 @@ async def approve_stage_values(
         actor_id=user.id,
         approve=True,
         branch_id=branch_id,
+        side_pointer_id=side_pointer_id,
     )
     return await step_service.view(session, row)
 
@@ -749,6 +779,7 @@ async def reject_stage_values(
     user: CurrentUser,
     session: SessionDep,
     branch_id: int | None = None,
+    side_pointer_id: int | None = None,
 ):
     row = await step_service.decide(
         session,
@@ -757,6 +788,7 @@ async def reject_stage_values(
         actor_id=user.id,
         approve=False,
         branch_id=branch_id,
+        side_pointer_id=side_pointer_id,
     )
     return await step_service.view(session, row)
 

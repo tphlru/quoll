@@ -21,13 +21,19 @@ from quoll.core.exceptions import (
     OperationForbiddenException,
 )
 from quoll.core.locking import lock_row
-from quoll.interactions import branch_service, sa_service, side_pointer_service, step_hooks
+from quoll.interactions import (
+    branch_service,
+    sa_service,
+    side_pointer_service,
+    step_hooks,
+)
 from quoll.interactions.access_policy import can_close
 from quoll.interactions.close_reasons import check_reason, interaction_level
 from quoll.interactions.models import (
     Branch,
     Interaction,
     InteractionRequest,
+    InteractionStageHistory,
     RequestKind,
     RequestStatus,
     SidePointer,
@@ -64,11 +70,6 @@ _REJECTED = {
     RequestKind.TRANSFER: AuditEventType.PROJECT_TRANSFER_REJECTED,
     RequestKind.CLOSE: AuditEventType.PROJECT_CLOSE_REJECTED,
     RequestKind.TRANSITION: AuditEventType.TRANSITION_REJECTED,
-}
-_LABELS = {
-    RequestKind.TRANSITION: "переход на следующий шаг",
-    RequestKind.CLOSE: "закрытие",
-    RequestKind.TRANSFER: "передача заявки",
 }
 
 
@@ -114,72 +115,81 @@ async def create(
     branch_close_reason_id: int | None = None,
     side_pointer_id: int | None = None,
 ) -> InteractionRequest:
-    if side_pointer_id is not None and (kind != RequestKind.TRANSITION or branch_id):
+    if side_pointer_id is not None and (
+        kind != RequestKind.TRANSITION or branch_id is not None
+    ):
         raise DomainRuleException(400, "Side pass asks only for a transition")
     # под захватом области: просьба не создаётся одновременно со сменой владельца
     scope = await lock_interaction_scope(session, interaction_id, actor_id)
     interaction = scope.interaction
     if interaction.owner_id != actor_id:
         raise OperationForbiddenException("request for someone else's interaction")
-
-    transition_id = None
-    pointer = None
-    if kind == RequestKind.TRANSITION and side_pointer_id is not None:
+    current = await _open_stage(session, interaction)
+    if side_pointer_id is not None:
+        # доп. прохождение просит со своего шага, а не с шага заявки
         pointer = await side_pointer_service.load_active(
             session, interaction_id, side_pointer_id
         )
         current = await session.get(Stage, pointer.stage_id)
+
+    transition_id = None
+    # просьба уводит вперёд с шага обработчика (ДС) - он переходит в PENDING
+    leaves_handler = False
+    if branch_id is not None and kind == RequestKind.TRANSFER:
+        raise DomainRuleException(400, "A branch is not transferred on its own")
+    if kind == RequestKind.CLOSE and branch_id is not None:
+        await branch_service.open_branch(session, scope, branch_id)
+        # обоснование менеджера и есть комментарий к причине
+        await check_reason(session, close_reason_id, CloseLevel.BRANCH, reason)
+    elif kind == RequestKind.TRANSITION:
+        if branch_id is not None:
+            # шаг ветки: откуда просят - стадия ветки, не договора
+            branch = await branch_service.open_branch(session, scope, branch_id)
+            current = await session.get(Stage, branch.state_id)
         edge = await _approval_edge(session, interaction, current, target_stage_id)
+        if branch_id is None and side_pointer_id is None:
+            # невозвратное ребро без отметки «подписан» - отказ сейчас, а не
+            # при одобрении
+            await _check_contract_rules(
+                session,
+                interaction,
+                current,
+                edge,
+                await session.get(Stage, target_stage_id),
+                interaction.workflow_id,
+            )
+        # руководителю приходит готовый шаг: поля и файлы проверены сразу
         await check_step(
-            session, interaction, current, edge, approved=True, side_pointer_id=pointer.id
+            session,
+            interaction,
+            current,
+            edge,
+            approved=True,
+            branch_id=branch_id,
+            side_pointer_id=side_pointer_id,
         )
         transition_id = edge.id
-        if current.handler and not edge.is_backward:
-            await step_hooks.check_leave(session, scope, current, edge, pointer.id)
-    else:
-        current = await _open_stage(session, interaction)
-        if branch_id is not None and kind == RequestKind.TRANSFER:
-            raise DomainRuleException(400, "A branch is not transferred on its own")
-        if kind == RequestKind.CLOSE and branch_id is not None:
-            await branch_service.open_branch(session, scope, branch_id)
-            # обоснование менеджера и есть комментарий к причине
-            await check_reason(session, close_reason_id, CloseLevel.BRANCH, reason)
-        elif kind == RequestKind.TRANSITION:
-            if branch_id is not None:
-                # шаг ветки: откуда просят - стадия ветки, не договора
-                branch = await branch_service.open_branch(session, scope, branch_id)
-                current = await session.get(Stage, branch.state_id)
-            edge = await _approval_edge(session, interaction, current, target_stage_id)
-            target = await session.get(Stage, target_stage_id)
-            if branch_id is None:
-                await _check_contract_rules(
-                    session, interaction, current, edge, target, interaction.workflow_id
-                )
-            # руководителю приходит готовый шаг: поля и файлы проверены сразу
-            await check_step(
-                session, interaction, current, edge, approved=True, branch_id=branch_id
-            )
-            transition_id = edge.id
-            if branch_id is None and current.handler and not edge.is_backward:
-                await step_hooks.check_leave(session, scope, current, edge, None)
-        elif kind == RequestKind.CLOSE:
-            stage = await _check_close_target(session, interaction, target_stage_id)
-            if stage.archived_at is not None:
-                raise DomainRuleException(409, f"Stage '{stage.id}' is archived")
+        leaves_handler = (
+            branch_id is None and current.handler is not None and not edge.is_backward
+        )
+        if leaves_handler:
+            await step_hooks.check_leave(session, scope, current, edge, side_pointer_id)
+    elif kind == RequestKind.CLOSE:
+        stage = await _check_close_target(session, interaction, target_stage_id)
+        if stage.archived_at is not None:
+            raise DomainRuleException(409, f"Stage '{stage.id}' is archived")
+        await check_reason(
+            session, close_reason_id, interaction_level(interaction), reason
+        )
+        if branch_close_reason_id is not None:
             await check_reason(
-                session, close_reason_id, interaction_level(interaction), reason
+                session, branch_close_reason_id, CloseLevel.BRANCH, reason
             )
-            if branch_close_reason_id is not None:
-                await check_reason(
-                    session, branch_close_reason_id, CloseLevel.BRANCH, reason
-                )
-        elif (
-            target_manager_id is not None
-            and await session.get(Manager, target_manager_id) is None
-        ):
-            raise DomainRuleException(
-                400, f"User '{target_manager_id}' is not a manager"
-            )
+    elif (
+        target_manager_id is not None
+        and await session.get(Manager, target_manager_id) is None
+    ):
+        raise DomainRuleException(400, f"User '{target_manager_id}' is not a manager")
 
     pending = await session.scalar(
         select(InteractionRequest.id).where(
@@ -211,10 +221,8 @@ async def create(
     )
     session.add(request)
     await session.flush()
-    if kind == RequestKind.TRANSITION and pointer is not None:
-        await step_hooks.submitted(session, scope, current, pointer.id)
-    elif kind == RequestKind.TRANSITION and branch_id is None and current.handler:
-        await step_hooks.submitted(session, scope, current, None)
+    if leaves_handler:
+        await step_hooks.submitted(session, scope, current, side_pointer_id, actor_id)
     record(
         session,
         actor_id=actor_id,
@@ -239,6 +247,13 @@ async def create(
     )
     await session.refresh(request)
     return request
+
+
+_LABELS = {
+    RequestKind.TRANSITION: "переход на следующий шаг",
+    RequestKind.CLOSE: "закрытие",
+    RequestKind.TRANSFER: "передача заявки",
+}
 
 
 async def _tell_requester(session, scope, request, decision: str, comment) -> None:
@@ -274,23 +289,27 @@ async def _approval_edge(
     return edge
 
 
+async def _from_handler(session: AsyncSession, request: InteractionRequest) -> bool:
+    """просьба о выходе с шага обработчика (ДС) - основного или доп. прохождения"""
+    if request.kind != RequestKind.TRANSITION or request.branch_id is not None:
+        return False
+    edge = await session.get(WorkflowTransition, request.transition_id)
+    return (await session.get(Stage, edge.from_stage_id)).handler is not None
+
+
 async def _pre_share(session: AsyncSession, found: InteractionRequest) -> set[int]:
-    """стадии, от которых зависит решение, - без блокировок"""
+    """стадии, от которых зависит решение, - без блокировок: их FOR SHARE
+    берётся раньше области заявки (см. share_stage)"""
+    if found.kind != RequestKind.TRANSITION:
+        return set()
     shared: set[int] = set()
-    if found.kind == RequestKind.TRANSITION:
+    if found.branch_id is not None or found.side_pointer_id is not None:
         edge = await session.get(WorkflowTransition, found.transition_id)
-        if found.branch_id is not None or found.side_pointer_id is not None:
-            shared |= {found.target_stage_id, edge.reject_to_stage_id} - {None}
-        current_stage_id = edge.from_stage_id
-        current = (
-            await session.get(Stage, current_stage_id)
-            if current_stage_id is not None
-            else None
+        shared |= {found.target_stage_id, edge.reject_to_stage_id} - {None}
+    if await _from_handler(session, found):
+        shared |= await step_hooks.pre_share(
+            session, found.interaction_id, found.side_pointer_id, found.target_stage_id
         )
-        if current is not None and current.handler:
-            shared |= await step_hooks.pre_share(
-                session, found.interaction_id, found.side_pointer_id, found.target_stage_id
-            )
     return shared
 
 
@@ -337,16 +356,6 @@ async def _stale_reason(
 ) -> str | None:
     """просьба сама стала недействительной - это не ошибка руководителя"""
     interaction = scope.interaction
-    if request.side_pointer_id is not None:
-        pointer = await session.get(SidePointer, request.side_pointer_id)
-        if pointer.status != SidePointerStatus.ACTIVE:
-            return "side pointer finished"
-        edge = await session.get(WorkflowTransition, request.transition_id)
-        if pointer.stage_id != edge.from_stage_id:
-            return "side pointer moved"
-        if not edge.is_active:
-            return "transition deactivated"
-        return None
     if interaction.owner_id != request.from_owner_id:
         return "interaction owner changed"
     if interaction.closed_at is not None:
@@ -356,7 +365,14 @@ async def _stale_reason(
         return "branch closed" if branch.closed_at is not None else None
     if request.kind == RequestKind.TRANSITION:
         edge = await session.get(WorkflowTransition, request.transition_id)
-        if request.branch_id is not None:
+        if request.side_pointer_id is not None:
+            # основной указатель к доп. прохождению отношения не имеет
+            pointer = await session.get(SidePointer, request.side_pointer_id)
+            if pointer.status != SidePointerStatus.ACTIVE:
+                return "side pointer finished"
+            if pointer.stage_id != edge.from_stage_id:
+                return "side pointer moved"
+        elif request.branch_id is not None:
             branch = await session.get(Branch, request.branch_id)
             if branch.closed_at is not None:
                 return "branch closed"
@@ -366,11 +382,13 @@ async def _stale_reason(
             return "interaction moved"
         if not edge.is_active:
             return "transition deactivated"
-        current = await session.get(Stage, edge.from_stage_id)
-        if current.handler and not edge.is_backward:
-            sa = await sa_service.open_of_pass(session, interaction.id, None)
-            if sa is not None:
-                return await sa_service.stale_actions(session, interaction, sa.id)
+        if not edge.is_backward and await _from_handler(session, request):
+            sa = await sa_service.open_of_pass(
+                session, interaction.id, request.side_pointer_id
+            )
+            if sa is None:
+                return "agreement is not open"
+            return await sa_service.stale_actions(session, interaction, sa.id)
     if request.kind == RequestKind.CLOSE:
         # FOR SHARE: архивация, начатая раньше, закоммитится, и мы увидим
         # архив здесь, а не упадём позже в закрытии - просьба тогда осталась
@@ -427,18 +445,15 @@ async def approve(
     stale = await _stale_reason(session, scope, request)
     if stale is not None:
         _decide(request, RequestStatus.CANCELLED, actor_id, stale)
-        if request.kind == RequestKind.TRANSITION:
-            edge = await session.get(WorkflowTransition, request.transition_id)
-            current = await session.get(Stage, edge.from_stage_id)
-            if current.handler:
-                await step_hooks.returned(
-                    session,
-                    scope,
-                    request.side_pointer_id,
-                    stale,
-                    StageChangeKind.SA_RETURNED,
-                    actor_id=actor_id,
-                )
+        if await _from_handler(session, request):
+            await step_hooks.returned(
+                session,
+                scope,
+                request.side_pointer_id,
+                stale,
+                StageChangeKind.SA_RETURNED,
+                actor_id,
+            )
         record(
             session,
             actor_id=actor_id,
@@ -468,9 +483,8 @@ async def approve(
             "suggested": request.target_manager_id,
         }
     elif request.kind == RequestKind.TRANSITION and request.side_pointer_id is not None:
-        pointer = await side_pointer_service.load_active(
-            session, request.interaction_id, request.side_pointer_id
-        )
+        # ACTIVE и на месте - проверено в _stale_reason
+        pointer = await session.get(SidePointer, request.side_pointer_id)
         await side_pointer_service.move_locked(
             session,
             scope,
@@ -479,7 +493,6 @@ async def approve(
             comment or request.reason,
             approved=True,
             shared=shared,
-            actor_id=actor_id,
         )
         outcome = {"target_stage_id": request.target_stage_id}
     elif request.kind == RequestKind.TRANSITION and request.branch_id is not None:
@@ -544,31 +557,23 @@ async def reject(
     found = await session.get(InteractionRequest, request_id)
     if found is None:
         raise IdNotExistsException(InteractionRequest.__name__)
-    shared = await _pre_share(session, found)
-    scope, request = await _lock_for_decision(session, request_id, actor_id, shared=shared)
+    scope, request = await _lock_for_decision(
+        session, request_id, actor_id, shared=await _pre_share(session, found)
+    )
     _decide(request, RequestStatus.REJECTED, actor_id, comment)
-    if request.kind == RequestKind.TRANSITION and request.side_pointer_id is not None:
+    if await _from_handler(session, request):
+        # ДС - снова черновик до того, как отказ, возможно, уведёт с шага
         await step_hooks.returned(
             session,
             scope,
             request.side_pointer_id,
             comment,
             StageChangeKind.SA_REJECTED,
-            actor_id=actor_id,
+            actor_id,
         )
+    if request.kind == RequestKind.TRANSITION and request.side_pointer_id is not None:
         await _send_back_side(session, scope, request, comment)
     elif request.kind == RequestKind.TRANSITION:
-        edge = await session.get(WorkflowTransition, request.transition_id)
-        current = await session.get(Stage, edge.from_stage_id)
-        if current.handler:
-            await step_hooks.returned(
-                session,
-                scope,
-                None,
-                comment,
-                StageChangeKind.SA_REJECTED,
-                actor_id=actor_id,
-            )
         await _send_back(session, scope, request, comment)
     record(
         session,
@@ -637,63 +642,39 @@ async def _send_back_side(
     if target is None or target.archived_at is not None or not target.is_side:
         return
     pointer = await session.get(SidePointer, request.side_pointer_id)
-    if pointer.status != SidePointerStatus.ACTIVE or pointer.stage_id != edge.from_stage_id:
+    if (
+        pointer.status != SidePointerStatus.ACTIVE
+        or pointer.stage_id != edge.from_stage_id
+    ):
         return
-    from quoll.interactions.models import InteractionStageHistory
-
-    stage = await session.get(Stage, pointer.stage_id)
-    await step_hooks.abandon(session, scope, stage, pointer.id, comment, None)
+    actor_id = scope.actor.id
+    source = await session.get(Stage, pointer.stage_id)
+    await step_hooks.abandon(session, scope, source, pointer.id, comment, actor_id)
     pointer.stage_id = target.id
     session.add(
         InteractionStageHistory(
             interaction_id=scope.interaction.id,
             side_pointer_id=pointer.id,
-            from_stage_id=edge.from_stage_id,
+            from_stage_id=source.id,
             to_stage_id=target.id,
+            transition_id=edge.id,
             kind=StageChangeKind.REJECTION,
+            actor_id=actor_id,
             comment=comment,
         )
     )
-    await step_hooks.enter(session, scope, target, pointer.id, actor_id=None)
+    await step_hooks.enter(session, scope, target, pointer.id, actor_id)
 
 
 async def withdraw(session: AsyncSession, *, request_id: int, actor_id: str) -> None:
-    """автор отзывает сам: CAS одной строки, заявку не блокируем"""
+    """автор отзывает сам: CAS одной строки. Заявку блокируем, только если
+    просьба с шага обработчика - отзыв возвращает ДС в черновик"""
     found = await session.get(InteractionRequest, request_id)
     if found is None:
         raise IdNotExistsException(InteractionRequest.__name__)
-    if found.requested_by != actor_id:
-        raise OperationForbiddenException("withdraw someone else's request")
-    if found.kind == RequestKind.TRANSITION:
-        edge = await session.get(WorkflowTransition, found.transition_id)
-        current = await session.get(Stage, edge.from_stage_id)
-        if current.handler:
-            scope = await lock_interaction_scope(session, found.interaction_id, actor_id)
-            request = await lock_row(session, InteractionRequest, request_id)
-            if request.status != RequestStatus.PENDING:
-                raise DomainRuleException(409, f"Request is already {request.status}")
-            request.status = RequestStatus.CANCELLED
-            request.decided_by = actor_id
-            request.decided_at = func.now()
-            request.decision_comment = "withdrawn by author"
-            await step_hooks.returned(
-                session,
-                scope,
-                request.side_pointer_id,
-                "withdrawn by author",
-                StageChangeKind.SA_RETURNED,
-                actor_id=actor_id,
-            )
-            record(
-                session,
-                actor_id=actor_id,
-                event_type=AuditEventType.REQUEST_CANCELLED,
-                target_type=TargetType.REQUEST,
-                target_id=request_id,
-                new_value={"reason": "withdrawn by author"},
-            )
-            await session.flush()
-            return
+    scope = None
+    if await _from_handler(session, found):
+        scope = await lock_interaction_scope(session, found.interaction_id, actor_id)
     withdrawn = await session.scalar(
         update(InteractionRequest)
         .where(
@@ -710,10 +691,21 @@ async def withdraw(session: AsyncSession, *, request_id: int, actor_id: str) -> 
         .returning(InteractionRequest.id)
     )
     if withdrawn is None:
-        request = await session.get(InteractionRequest, request_id)
-        if request is None:
-            raise IdNotExistsException(InteractionRequest.__name__)
+        request = await session.get(
+            InteractionRequest, request_id, populate_existing=True
+        )
+        if request.requested_by != actor_id:
+            raise OperationForbiddenException("withdraw someone else's request")
         raise DomainRuleException(409, f"Request is already {request.status}")
+    if scope is not None:
+        await step_hooks.returned(
+            session,
+            scope,
+            found.side_pointer_id,
+            "withdrawn by author",
+            StageChangeKind.SA_RETURNED,
+            actor_id,
+        )
     record(
         session,
         actor_id=actor_id,

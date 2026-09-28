@@ -14,7 +14,6 @@ from quoll.core.exceptions import (
 from quoll.core.locking import lock_row
 from quoll.workflows.graph_policy import StageFacts, edge_facts, graph_problems
 from quoll.workflows.models import Stage, Workflow, WorkflowTransition
-from quoll.workflows.step_handlers import SUPPLEMENTARY_AGREEMENT
 from quoll.workflows.schemas import (
     StageCreate,
     StageUpdate,
@@ -23,6 +22,7 @@ from quoll.workflows.schemas import (
     WorkflowTransitionUpdate,
     WorkflowUpdate,
 )
+from quoll.workflows.step_handlers import SUPPLEMENTARY_AGREEMENT
 
 # концы ребра - то, на что ссылается история переходов заявок
 _EDGE_ENDS = frozenset({"from_stage_id", "to_stage_id"})
@@ -42,7 +42,12 @@ async def check_graph(
     if not (workflow.is_published or full):
         return
     # здесь, а не наверху: модели заявок сами импортируют модели воркфлоу
-    from quoll.interactions.models import Branch, Interaction, SidePointer, SidePointerStatus
+    from quoll.interactions.models import (
+        Branch,
+        Interaction,
+        SidePointer,
+        SidePointerStatus,
+    )
 
     stages = (
         await session.scalars(select(Stage).where(Stage.workflow_id == workflow.id))
