@@ -1,16 +1,16 @@
 # Дизайн: подсистема комментариев к шагам взаимодействий (CRM quoll)
 
-Редакция 17 (Gold Standard), 29.09.2026.
-Устранены финальные краевые дефекты 152-ФЗ и стейт-машины очередей.
+Редакция 18 (Flawless Monolith), 29.09.2026.
+Устранены последние P2, найденные Техническим Аудитором в 16-й редакции (опечатки CHECK-констрейнтов, Dead Letter Queue и защита от переноса родителей в другие Зоны).
 
 ---
 
 ## 0. Архитектурные решения
 | # | Вопрос | Решение |
 |---|---|---|
-| **Р1** | Изоляция Зон | Гарантируется триггером в СУБД: `branch_id` И `side_pointer_id` родителя и ответа обязаны совпадать |
-| **Р2** | Scrub (152-ФЗ) | Анонимизирует `text`, `previous_text`, `author_name` и глобально обнуляет все FK (`uploaded_by`, `deleted_by`). Разделяет логику авторов и модераторов. |
-| **Р3** | Lock-Free S3 | Воркеры очереди не держат транзакции БД во время I/O (S3). Зависшие задачи восстанавливаются. |
+| **Р1** | Изоляция Зон | Гарантируется триггером в СУБД (C22). Запрещен перенос существующих комментариев в другие зоны. |
+| **Р2** | Scrub (152-ФЗ) | Анонимизирует ПДн и глобально обнуляет все FK. Разделяет логику авторов и модераторов. |
+| **Р3** | Lock-Free S3 | Воркеры очереди не держат транзакции БД во время I/O. Зависшие задачи восстанавливаются. Необрабатываемые файлы падают в Dead Letter Queue (`FAILED`). |
 
 ---
 
@@ -26,20 +26,20 @@
 1. **Загрузка:** `INSERT INTO attachments` (`status = UPLOADED`).
 2. **Привязка:** Атомарный `UPDATE attachments SET status='CLAIMED', updated_at=NOW() WHERE id = :id AND status='UPLOADED' RETURNING id`. Вставка в `comment_attachments`.
 3. **Orphan Sweep:** Фоновый Job 1h: `UPDATE attachments SET status='PURGING', updated_at=NOW() WHERE id IN (SELECT id FROM attachments WHERE (status='UPLOADED' AND created_at < NOW() - 24h) OR (status='PURGING' AND updated_at < NOW() - 1h) FOR UPDATE SKIP LOCKED)`. Удаляет из S3 -> `UPDATE status='PURGED'`.
-4. **Soft-Delete Коммента / Detach через Edit:** `is_deleted = true`, `detached_at = NOW()`. `UPSERT` файла в `attachment_purge_queue` (`reason='SOFT_DELETE'`, `status='PENDING'`). Если Заявка `CLOSED` -> `execute_after = NOW() + 30 days`, иначе `NULL`.
+4. **Soft-Delete Коммента / Detach через Edit:** Для коммента: `is_deleted = true`, `deleted_at = NOW()`. Для файла: `detached_at = NOW()` в `comment_attachments`. `UPSERT` файла в `attachment_purge_queue` (`reason='SOFT_DELETE'`, `status='PENDING'`). Если Заявка `CLOSED` -> `execute_after = NOW() + 30 days`, иначе `NULL`.
 5. **Scrub (152-ФЗ):** Разрешает удаление пользователя из БД.
    - Глобальное обнуление метаданных: `UPDATE attachments SET uploaded_by = NULL WHERE uploaded_by = :id` и `UPDATE comments SET deleted_by = NULL WHERE deleted_by = :id`.
    - Выжигает ПДн: `UPDATE comments SET text='[УДАЛЕНО]', author_name='[УДАЛЕНО]', author_id=NULL, is_scrubbed=true WHERE author_id = :id`.
    - Выжигает историю: `UPDATE comment_versions SET previous_text='[УДАЛЕНО]' WHERE comment_id IN (SELECT id FROM comments WHERE author_id = :id)`.
    - Выжигает файлы: `UPSERT` всех файлов коммента в очередь с `reason='SCRUB', execute_after=NOW(), status='PENDING'`. 
-6. **Закрытие Заявки:** `UPDATE attachment_purge_queue SET execute_after = NOW() + 30 days, updated_at=NOW() WHERE interaction_id = :id AND execute_after IS NULL AND status != 'DONE'`.
-7. **Reopen Заявки:** `UPDATE attachment_purge_queue SET execute_after = NULL, status = 'PENDING', updated_at=NOW() WHERE interaction_id = :id AND reason='SOFT_DELETE' AND status != 'DONE'`.
+6. **Закрытие Заявки:** `UPDATE attachment_purge_queue SET execute_after = NOW() + 30 days, updated_at=NOW() WHERE interaction_id = :id AND execute_after IS NULL AND status NOT IN ('DONE', 'FAILED')`.
+7. **Reopen Заявки:** `UPDATE attachment_purge_queue SET execute_after = NULL, status = 'PENDING', updated_at=NOW() WHERE interaction_id = :id AND reason='SOFT_DELETE' AND status NOT IN ('DONE', 'FAILED')`.
 8. **Очистка улик (Lock-Free Worker & Crash Recovery):** 
    - *Фаза 1 (DB)*: `UPDATE attachment_purge_queue SET status='PROCESSING', updated_at=NOW() WHERE attachment_id IN (SELECT attachment_id FROM attachment_purge_queue WHERE (status='PENDING' AND execute_after <= NOW()) OR (status='PROCESSING' AND updated_at < NOW() - 1h) FOR UPDATE SKIP LOCKED) RETURNING storage_key`.
    - *Фаза 2 (Network)*: Вызов S3 DELETE (Транзакция БД отпущена).
    - *Фаза 3 (DB)*:
      - *Успех*: `UPDATE queue SET status='DONE', processed_at = NOW()`. `UPDATE attachments SET status='PURGED'`.
-     - *Ошибка (S3)*: `UPDATE queue SET status='PENDING', attempts = attempts + 1, updated_at=NOW(), execute_after = CASE WHEN execute_after IS NOT NULL THEN NOW() + INTERVAL '1h' ELSE NULL END`.
+     - *Ошибка (S3)*: `UPDATE queue SET status = CASE WHEN attempts >= 3 THEN 'FAILED' ELSE 'PENDING' END, attempts = attempts + 1, updated_at=NOW(), execute_after = CASE WHEN execute_after IS NOT NULL THEN NOW() + INTERVAL '1h' ELSE NULL END`.
 9. **Queue Retention:** Фоновый Job удаляет закрытые задачи из очереди: `DELETE FROM attachment_purge_queue WHERE status = 'DONE' AND processed_at < NOW() - 7 days`.
 
 ---
@@ -123,11 +123,12 @@ CREATE TABLE attachment_purge_queue (
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     processed_at TIMESTAMPTZ NULL,
 
-    CONSTRAINT chk_queue_status CHECK (status IN ('PENDING', 'PROCESSING', 'DONE'))
+    CONSTRAINT chk_queue_status CHECK (status IN ('PENDING', 'PROCESSING', 'DONE', 'FAILED'))
 );
 CREATE INDEX ix_purge_queue_execute_after ON attachment_purge_queue (execute_after) WHERE status = 'PENDING';
 CREATE INDEX ix_purge_queue_interaction ON attachment_purge_queue (interaction_id);
 CREATE INDEX ix_purge_queue_processing ON attachment_purge_queue (updated_at) WHERE status = 'PROCESSING';
+CREATE INDEX ix_purge_queue_done ON attachment_purge_queue (processed_at) WHERE status = 'DONE';
 
 -- Триггер для аппаратной гарантии изоляции зон (C22)
 CREATE OR REPLACE FUNCTION check_zones() RETURNS TRIGGER AS $$
@@ -135,6 +136,10 @@ DECLARE
     p_branch BIGINT;
     p_side BIGINT;
 BEGIN
+    IF TG_OP = 'UPDATE' AND (NEW.branch_id IS DISTINCT FROM OLD.branch_id OR NEW.side_pointer_id IS DISTINCT FROM OLD.side_pointer_id) THEN
+        RAISE EXCEPTION 'Cannot change zone of existing comment';
+    END IF;
+
     IF NEW.reply_to_comment_id IS NOT NULL THEN
         SELECT branch_id, side_pointer_id INTO p_branch, p_side FROM comments WHERE id = NEW.reply_to_comment_id;
         IF p_branch IS DISTINCT FROM NEW.branch_id OR p_side IS DISTINCT FROM NEW.side_pointer_id THEN
