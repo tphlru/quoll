@@ -1,8 +1,16 @@
 # Дизайн: подсистема комментариев к шагам взаимодействий (CRM quoll)
 
-Редакция 19 (Restored Full Context). Возвращены вырезанные разделы API и бизнес-требований.
 
-Редакция 6, 28.09.2026. Полная архитектурная сходимость промышленного уровня.
+Редакция 20 (Harmonized Monolith), 29.09.2026. Гармонизация бизнес-контекста и технического ядра.
+Устранены конфликты между старыми (до Ред. 14) и новыми секциями после merge:
+- [P0] Раздел 2.4 больше не требует DELETE FROM attachments (FK RESTRICT в очереди). Файлы ждут воркера.
+- [P1] Триггер check_zones теперь проверяет stage_id (полное покрытие C5).
+- [P1] C16 разрешает админу скачивать файлы из удалённых комментариев (расследование инцидентов).
+- [P1] Убрано противоречие "Detach через Edit" (решение Р10 об иммутабельности).
+- [P2] C9 получил явное исключение для Scrub на закрытых заявках (152-ФЗ исполним всегда).
+- [P2] PATCH теперь явно вставляет запись в comment_versions (аудит истории).
+- [P2] Worker RETURNING включает attachment_id для точечного обновления Фазы 3.
+- [P3] Добавлен DB CHECK для длины текста (C12) и композитный индекс для timeline.
 Устранены и закрыты:
 - [P0] Уязвимость IDOR при привязке вложений (C17, проверка авторства, изоляция);
 - [P1] Изоляция веток боковых прохождений (C5, требование совпадения side_pointer_id);
@@ -163,7 +171,8 @@
    * Разрешено исключительно автору (`author_id == actor.id`).
    * Запрещено, если комментарий удален (`COM-006`).
    * Запрещено, если заявка/ветка/ДС закрыта (`COM-016`, `COM-018`).
-   * Допустимо менять только текст (`text`). Состав вложений неизменен.
+   * Допустимо менять только текст (`text`). Состав вложений неизменен (Р10).
+   * Перед обновлением: `INSERT INTO comment_versions (comment_id, previous_text) VALUES (:id, :old_text)`.
    * Устанавливается `is_edited = true`, обновляется `updated_at`.
    * В аудит пишется событие `COMMENT_UPDATED` со старым и новым текстом.
 3. **Мягкое удаление (`DELETE`):**
@@ -186,7 +195,7 @@
 1. **Загрузка:** `INSERT INTO attachments` (`status = UPLOADED`).
 2. **Привязка:** Атомарный `UPDATE attachments SET status='CLAIMED', updated_at=NOW() WHERE id = :id AND status='UPLOADED' RETURNING id`. Вставка в `comment_attachments`.
 3. **Orphan Sweep:** Фоновый Job 1h: `UPDATE attachments SET status='PURGING', updated_at=NOW() WHERE id IN (SELECT id FROM attachments WHERE (status='UPLOADED' AND created_at < NOW() - 24h) OR (status='PURGING' AND updated_at < NOW() - 1h) FOR UPDATE SKIP LOCKED)`. Удаляет из S3 -> `UPDATE status='PURGED'`.
-4. **Soft-Delete Коммента / Detach через Edit:** Для коммента: `is_deleted = true`, `deleted_at = NOW()`. Для файла: `detached_at = NOW()` в `comment_attachments`. `UPSERT` файла в `attachment_purge_queue` (`reason='SOFT_DELETE'`, `status='PENDING'`). Если Заявка `CLOSED` -> `execute_after = NOW() + 30 days`, иначе `NULL`.
+4. **Soft-Delete Коммента:** `is_deleted = true`, `deleted_at = NOW()`. Файлы коммента: `UPSERT` в `attachment_purge_queue` (`reason='SOFT_DELETE'`, `status='PENDING'`). Если Заявка `CLOSED` -> `execute_after = NOW() + 30 days`, иначе `NULL`.
 5. **Scrub (152-ФЗ):** Разрешает удаление пользователя из БД.
    - Глобальное обнуление метаданных: `UPDATE attachments SET uploaded_by = NULL WHERE uploaded_by = :id` и `UPDATE comments SET deleted_by = NULL WHERE deleted_by = :id`.
    - Выжигает ПДн: `UPDATE comments SET text='[УДАЛЕНО]', author_name='[УДАЛЕНО]', author_id=NULL, is_scrubbed=true WHERE author_id = :id`.
@@ -195,7 +204,7 @@
 6. **Закрытие Заявки:** `UPDATE attachment_purge_queue SET execute_after = NOW() + 30 days, updated_at=NOW() WHERE interaction_id = :id AND execute_after IS NULL AND status NOT IN ('DONE', 'FAILED')`.
 7. **Reopen Заявки:** `UPDATE attachment_purge_queue SET execute_after = NULL, status = 'PENDING', updated_at=NOW() WHERE interaction_id = :id AND reason='SOFT_DELETE' AND status NOT IN ('DONE', 'FAILED')`.
 8. **Очистка улик (Lock-Free Worker & Crash Recovery):** 
-   - *Фаза 1 (DB)*: `UPDATE attachment_purge_queue SET status='PROCESSING', updated_at=NOW() WHERE attachment_id IN (SELECT attachment_id FROM attachment_purge_queue WHERE (status='PENDING' AND execute_after <= NOW()) OR (status='PROCESSING' AND updated_at < NOW() - 1h) FOR UPDATE SKIP LOCKED) RETURNING storage_key`.
+   - *Фаза 1 (DB)*: `UPDATE attachment_purge_queue SET status='PROCESSING', updated_at=NOW() WHERE attachment_id IN (SELECT attachment_id FROM attachment_purge_queue WHERE (status='PENDING' AND execute_after <= NOW()) OR (status='PROCESSING' AND updated_at < NOW() - 1h) FOR UPDATE SKIP LOCKED) RETURNING attachment_id, storage_key`.
    - *Фаза 2 (Network)*: Вызов S3 DELETE (Транзакция БД отпущена).
    - *Фаза 3 (DB)*:
      - *Успех*: `UPDATE queue SET status='DONE', processed_at = NOW()`. `UPDATE attachments SET status='PURGED'`.
@@ -245,6 +254,7 @@ CREATE TABLE comments (
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
 
     CONSTRAINT chk_comments_text_not_empty CHECK (text ~ '[^\s]' OR is_scrubbed = TRUE),
+    CONSTRAINT chk_comments_text_length CHECK (length(text) <= 4000),
     CONSTRAINT chk_comments_zones CHECK (branch_id IS NULL OR side_pointer_id IS NULL),
     CONSTRAINT chk_comments_deleted CHECK (is_deleted = FALSE OR deleted_at IS NOT NULL),
     
@@ -254,6 +264,7 @@ CREATE TABLE comments (
 );
 
 CREATE INDEX ix_comments_interaction_id ON comments(interaction_id);
+CREATE INDEX ix_comments_timeline ON comments(interaction_id, id ASC);
 CREATE INDEX ix_comments_reply_to ON comments(reply_to_comment_id);
 CREATE INDEX ix_comments_author_id ON comments(author_id);
 
@@ -306,20 +317,24 @@ CREATE INDEX ix_purge_queue_interaction ON attachment_purge_queue (interaction_i
 CREATE INDEX ix_purge_queue_processing ON attachment_purge_queue (updated_at) WHERE status = 'PROCESSING';
 CREATE INDEX ix_purge_queue_done ON attachment_purge_queue (processed_at) WHERE status = 'DONE';
 
--- Триггер для аппаратной гарантии изоляции зон (C22)
+-- Триггер для аппаратной гарантии изоляции зон и шагов (C5, C22)
 CREATE OR REPLACE FUNCTION check_zones() RETURNS TRIGGER AS $$
 DECLARE
+    p_stage INTEGER;
     p_branch BIGINT;
     p_side BIGINT;
 BEGIN
-    IF TG_OP = 'UPDATE' AND (NEW.branch_id IS DISTINCT FROM OLD.branch_id OR NEW.side_pointer_id IS DISTINCT FROM OLD.side_pointer_id) THEN
-        RAISE EXCEPTION 'Cannot change zone of existing comment';
+    IF TG_OP = 'UPDATE' AND (NEW.branch_id IS DISTINCT FROM OLD.branch_id OR NEW.side_pointer_id IS DISTINCT FROM OLD.side_pointer_id OR NEW.stage_id IS DISTINCT FROM OLD.stage_id) THEN
+        RAISE EXCEPTION 'Cannot change zone/stage of existing comment';
     END IF;
 
     IF NEW.reply_to_comment_id IS NOT NULL THEN
-        SELECT branch_id, side_pointer_id INTO p_branch, p_side FROM comments WHERE id = NEW.reply_to_comment_id;
+        SELECT stage_id, branch_id, side_pointer_id INTO p_stage, p_branch, p_side FROM comments WHERE id = NEW.reply_to_comment_id;
+        IF p_stage IS DISTINCT FROM NEW.stage_id THEN
+            RAISE EXCEPTION 'Stage isolation violated (C5)';
+        END IF;
         IF p_branch IS DISTINCT FROM NEW.branch_id OR p_side IS DISTINCT FROM NEW.side_pointer_id THEN
-            RAISE EXCEPTION 'Zone isolation violated (C22)';
+            RAISE EXCEPTION 'Zone isolation violated (C5)';
         END IF;
     END IF;
     RETURN NEW;
@@ -343,14 +358,14 @@ FOR EACH ROW EXECUTE FUNCTION check_zones();
 | **C6** | `actor_id != comment.author_id ⇒ edit_forbidden` | Service + Policy | Откат транзакции, 403 | `COM-004` |
 | **C7** | `(actor_id != comment.author_id AND actor.role != 'admin') ⇒ delete_forbidden` | Service + Policy | Откат транзакции, 403 | `COM-005` |
 | **C8** | `comment.is_deleted == true ⇒ edit_forbidden` | Service | Откат транзакции, 409 | `COM-006` |
-| **C9** | `interaction.status == CLOSED OR (branch_id IS NOT NULL AND branch.closed_at IS NOT NULL) OR (side_pointer_id IS NOT NULL AND side_pointer.status != 'ACTIVE') ⇒ mutate_forbidden` | Service (под FOR SHARE) | Откат транзакции, 409 | `COM-016`, `COM-018` |
+| **C9** | `(interaction.status == CLOSED OR (branch_id IS NOT NULL AND branch.closed_at IS NOT NULL) OR (side_pointer_id IS NOT NULL AND side_pointer.status != 'ACTIVE')) AND action != 'scrub' ⇒ mutate_forbidden` | Service (под FOR SHARE) | Откат транзакции, 409 | `COM-016`, `COM-018` |
 | **C10** | `count(attachment_ids) <= 10` | Schema + Service | Откат транзакции, 422 | `COM-014` |
 | **C11** | `attachment_id = A ⇒ A exists in attachments` | Service | Откат транзакции, 404 | `COM-015` |
 | **C12** | `length(trim(text)) BETWEEN 1 AND 4000` | DB (`CHECK`) + Schema | Откат транзакции, 422 | `COM-007`, `COM-008` |
 | **C13** | `is_deleted == true ⇒ text masked in API` | Service / Serializer | Маскирование на выходе | — |
 | **C14** | `author_name, author_role immutable` | Service | Фиксация при INSERT | — |
 | **C15** | `is_deleted == true AND deleted_at IS NOT NULL` | DB (`CHECK`) | Откат транзакции на уровне СУБД | — |
-| **C16** | `attachment downloadable ⇒ ∃ comment ∈ comment_attachments: comment.is_deleted = false AND can_read(user, comment.interaction)` | `document_service.py` | 403 Forbidden | `COM-002` |
+| **C16** | `attachment downloadable ⇒ ∃ comment ∈ comment_attachments: (comment.is_deleted = false OR actor.role == 'admin') AND can_read(user, comment.interaction)` | `document_service.py` | 403 Forbidden | `COM-002` |
 | **C17** | `∀ a ∈ attachment_ids ⇒ a.uploaded_by == actor.id ∧ a.storage_key ~ '^comments/' ∧ a unbound` | Service + DB (`UNIQUE`) | Откат транзакции, 403 / 409 | `COM-015` |
 | **C18** | `is_scrubbed == true ⇒ is_deleted == true ∧ text == '[ДАННЫЕ УДАЛЕНЫ ПО ТРЕБОВАНИЮ 152-ФЗ]' ∧ attachments count == 0` | Service (Scrub) | Гарантия очистки ПДн | — |
 | **C19** | `stage.is_terminal == true ⇒ comment_forbidden` | Service | Откат транзакции, 400 | `COM-019` |
@@ -376,12 +391,12 @@ FOR EACH ROW EXECUTE FUNCTION check_zones();
    comment.text = "[ДАННЫЕ УДАЛЕНЫ ПО ТРЕБОВАНИЮ 152-ФЗ]"
    ```
 3. Читаются все `storage_key` привязанных файлов.
-4. В таблицу `attachment_purge_queue` вставляются записи для каждого `storage_key`.
-5. Удаляются строки из `comment_attachments` и `attachments`.
+4. В таблицу `attachment_purge_queue` вставляются записи для каждого `storage_key` с `reason='SCRUB', execute_after=NOW()`.
+5. Проставляется `is_deleted = true` для строк в `comment_attachments`. Строки в `attachments` **не удаляются** (FK `ON DELETE RESTRICT` в очереди); воркер переведёт их в `PURGED` на Фазе 3.
 6. Санитизируются строки в `audit_logs` для данного `comment_id`.
 7. Фиксируется событие аудита `AuditEventType.COMMENT_SCRUBBED`.
 8. Коммит транзакции.
-9. Фоновый воркер `clean_purged_attachments()` вычитывает очередь `attachment_purge_queue`, удаляет объекты из S3 с ретраями и проставляет `processed_at = now()`.
+9. Фоновый воркер `clean_purged_attachments()` вычитывает очередь `attachment_purge_queue`, удаляет объекты из S3 с ретраями, переводит `attachments.status='PURGED'` и проставляет `processed_at = now()`.
 
 ---
 
