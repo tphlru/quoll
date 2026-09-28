@@ -48,10 +48,6 @@ class Workflow(Base, IdMixin, TimestampMixin):
 
 class Stage(Base, IdMixin, TimestampMixin):
     __table_args__ = (
-        CheckConstraint(
-            "NOT (is_terminal = TRUE AND consumes_capacity = TRUE)",
-            name="chk_stage_terminal_no_capacity",
-        ),
         # дублирует первичный ключ, но нужна как цель составного ключа
         # из interactions - чтобы стадия не оказалась из чужого воркфлоу
         UniqueConstraint("id", "workflow_id", name="uq_stages_id_workflow_id"),
@@ -94,10 +90,6 @@ class Stage(Base, IdMixin, TimestampMixin):
     # заявка закрыта, слот менеджера освобождается
     is_terminal: Mapped[bool] = mapped_column(
         Boolean, default=False, server_default="false", index=True
-    )
-    # стадия занимает слот менеджера
-    consumes_capacity: Mapped[bool] = mapped_column(
-        Boolean, default=True, server_default="true", index=True
     )
     # стадию не удаляют, а архивируют: на неё ссылаются история и документы
     archived_at: Mapped[datetime | None] = mapped_column(

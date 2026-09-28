@@ -51,9 +51,7 @@ class StageBase(AppBaseModel):
     description: str | None = None
     position: int = 0
     workflow_id: int
-    # без дефолтов: иначе черновая стадия случайно начнёт занимать слот
     is_terminal: bool
-    consumes_capacity: bool
     # флаги веток, как и остальные, после создания не меняются
     is_branch_stage: bool = False
     is_branch_start: bool = False
@@ -81,15 +79,6 @@ class StageBase(AppBaseModel):
     def check_branch_start(self):
         if self.is_branch_start and not self.is_branch_stage:
             raise ValueError("Branch start must be a branch stage")
-        return self
-
-    @model_validator(mode="after")
-    def check_terminal_semantics(self):
-        if self.is_terminal and self.consumes_capacity:
-            raise ValueError(
-                "Terminal stage cannot consume capacity: "
-                "consumes_capacity must be False when is_terminal is True"
-            )
         return self
 
 

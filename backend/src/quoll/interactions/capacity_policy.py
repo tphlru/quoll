@@ -26,12 +26,12 @@ logger = logging.getLogger(__name__)
 def counts_toward_capacity(stage: Stage | None, is_paused: bool, slot: str) -> bool:
     """занимает ли заявка активный слот менеджера.
 
-    черновик без стадии, закрытая, на паузе и пассивная (Д19) - не занимают
+    черновик без стадии, закрытая, на паузе и пассивная (Д19) - не занимают.
+    доп. указатель слот не занимает - он не меняет stage заявки (Д42)
     """
     return (
         stage is not None
         and not stage.is_terminal
-        and stage.consumes_capacity
         and not is_paused
         and slot == SlotKind.ACTIVE
     )
@@ -48,8 +48,8 @@ def is_open_project(stage: Stage | None) -> bool:
 
 def capacity_filter_expression() -> ColumnElement[bool]:
     return and_(
+        Interaction.state_id.is_not(None),
         Interaction.closed_at.is_(None),
-        Stage.consumes_capacity.is_(True),
         Interaction.is_paused.is_(False),
         Interaction.slot == SlotKind.ACTIVE,
     )

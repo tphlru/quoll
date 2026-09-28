@@ -494,7 +494,6 @@ def _fits(target: Stage, archived: Stage) -> bool:
         and target.is_terminal == archived.is_terminal
         and target.is_branch_stage == archived.is_branch_stage
         and target.is_parallel == archived.is_parallel
-        and (archived.consumes_capacity or not target.consumes_capacity)
     )
 
 
@@ -617,7 +616,7 @@ async def archive_stage(
             raise DomainRuleException(
                 409,
                 "Relocation target must be an active stage of this workflow with "
-                "the same terminality that does not add capacity; pass it explicitly",
+                "the same terminality and level; pass it explicitly",
             )
         await session.execute(
             update(Interaction)

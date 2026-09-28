@@ -50,10 +50,6 @@ async def ensure_reference_workflow(session: AsyncSession) -> Workflow | None:
                 name=stage["name"],
                 position=stage["position"],
                 is_terminal=stage.get("terminal", False),
-                # на терминальной и параллельной заявка слот не держит
-                consumes_capacity=not (
-                    stage.get("terminal", False) or stage.get("parallel", False)
-                ),
                 is_parallel=stage.get("parallel", False),
                 is_branch_stage=stage.get("branch", False),
                 is_branch_start=stage.get("branch_start", False),
